@@ -1,0 +1,38 @@
+[package]
+name = "app-core"
+version = "3.0.0"
+edition = "2021"
+rust-version = "1.77"
+description = "AI Call Assistant core: audio capture, STT, LLM streaming, session state machine, settings"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "io-util"] }
+tokio-util = { version = "0.7", default-features = false }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+async-trait = "0.1"
+base64 = "0.22"
+bytes = "1"
+
+# WASAPI loopback capture of the default render device.
+cpal = "0.15"
+
+[target.'cfg(windows)'.dependencies]
+# DPAPI (CryptProtectData / CryptUnprotectData) for secret storage at rest.
+# LocalFree lives in Win32_Foundation in this windows-crate version.
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

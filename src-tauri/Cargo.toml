@@ -1,0 +1,52 @@
+[workspace]
+members = ["core"]
+
+[package]
+name = "aicallhelper"
+version = "3.0.0"
+description = "AI Call Assistant — push-to-record interview copilot"
+authors = ["you"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "aicallhelper_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# The entire pipeline lives in `app-core`, which knows nothing about Tauri.
+# That is what lets `cargo test -p app-core` run the state machine, parsers and
+# providers without compiling (or linking) the whole webview shell.
+app-core = { path = "core" }
+
+tauri = { version = "2", features = [] }
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-single-instance = "2"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+
+[target.'cfg(windows)'.dependencies]
+# Pinned to the same minor version wry resolves (webview2-com 0.38) so the COM
+# interface types unify with what `with_webview` hands us. Used only to hear
+# WebView2's ProcessFailed event — the crash signal behind the rate-limited
+# webview reload (§11).
+webview2-com = "0.38"
+
+[features]
+# This feature is used for production builds where `devUrl` is not used.
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+# Deliberately NOT panic = "abort": §11 requires that a panic in one answer
+# pipeline never takes the process down (each session is isolated and the
+# worst case is one failed answer), and the shutdown-path catch_unwind in
+# window.rs would be inert under abort semantics.
+strip = true

@@ -1,0 +1,147 @@
+/**
+ * The real bridge's whole job is "one error path": anything invoke throws must
+ * come back as an envelope, never as a rejection the UI has to catch.
+ */
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
+import { getBridge, setBridge, type Bridge } from '../bridge';
+import type { Envelope, SessionId } from '../types';
+
+vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }));
+vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn() }));
+
+const mockInvoke = vi.mocked(invoke);
+const mockListen = vi.mocked(listen);
+
+const ok = <T,>(value: T): Envelope<T> => ({ ok: true, value });
+
+beforeEach(() => {
+  mockInvoke.mockReset();
+  mockListen.mockReset();
+  mockListen.mockResolvedValue(() => undefined);
+});
+
+describe('envelope discipline', () => {
+  it('converts a rejected invoke into an internal-code error envelope', async () => {
+    mockInvoke.mockRejectedValueOnce(new Error('ipc exploded'));
+    const env = await getBridge().startSession();
+    expect(env).toEqual({ ok: false, error: { code: 'internal', message: 'ipc exploded' } });
+  });
+
+  it('stringifies non-Error throwables so the message is never "[object Object]" surprise-free', async () => {
+    mockInvoke.mockRejectedValueOnce('plain string failure');
+    const env = await getBridge().getSettings();
+    expect(env).toEqual({ ok: false, error: { code: 'internal', message: 'plain string failure' } });
+  });
+
+  it('passes a resolved envelope through untouched', async () => {
+    mockInvoke.mockResolvedValueOnce(ok<SessionId>(41));
+    const env = await getBridge().startSession();
+    expect(env).toEqual(ok(41));
+  });
+
+  it('never rejects: every command method resolves even when invoke throws', async () => {
+    mockInvoke.mockRejectedValue(new Error('down'));
+    const b = getBridge();
+    await expect(b.getSettings()).resolves.toMatchObject({ ok: false });
+    await expect(b.setSettings({})).resolves.toMatchObject({ ok: false });
+    await expect(b.startSession()).resolves.toMatchObject({ ok: false });
+    await expect(b.stopSession(1)).resolves.toMatchObject({ ok: false });
+    await expect(b.ask('q')).resolves.toMatchObject({ ok: false });
+    await expect(b.hotkeyStatus()).resolves.toMatchObject({ ok: false });
+  });
+});
+
+describe('command wiring', () => {
+  it('uses the snake_case command names and argument shapes the core registered', async () => {
+    mockInvoke.mockResolvedValue(ok(null));
+    const b = getBridge();
+    await b.getSettings();
+    expect(mockInvoke).toHaveBeenLastCalledWith('get_settings', undefined);
+    await b.setSettings({ resume: 'r' });
+    expect(mockInvoke).toHaveBeenLastCalledWith('set_settings', { patch: { resume: 'r' } });
+    await b.startSession();
+    expect(mockInvoke).toHaveBeenLastCalledWith('start_session', undefined);
+    // Tauri maps the Rust `session_id` parameter to a camelCase `sessionId`
+    // argument key — `{ id }` would fail every stop with a missing-key error.
+    await b.stopSession(4);
+    expect(mockInvoke).toHaveBeenLastCalledWith('stop_session', { sessionId: 4 });
+    await b.ask('hello');
+    expect(mockInvoke).toHaveBeenLastCalledWith('ask', { text: 'hello' });
+    await b.hotkeyStatus();
+    expect(mockInvoke).toHaveBeenLastCalledWith('hotkey_status', undefined);
+    b.cancelSession(9);
+    expect(mockInvoke).toHaveBeenLastCalledWith('cancel_session', { sessionId: 9 });
+  });
+
+  it('cancelSession swallows a rejection (cancel races teardown by design)', async () => {
+    mockInvoke.mockRejectedValueOnce(new Error('already gone'));
+    getBridge().cancelSession(2);
+    // A leaked rejection would fail the test run as unhandled.
+    await new Promise((r) => setTimeout(r, 0));
+    expect(mockInvoke).toHaveBeenCalledWith('cancel_session', { sessionId: 2 });
+  });
+});
+
+describe('events', () => {
+  // Holder object rather than a bare let: TS narrows a closure-assigned let
+  // to its initializer and would reject the later call as `never`.
+  type TauriCallback = (event: { payload: unknown }) => void;
+
+  function captureListen(result: Promise<() => void>) {
+    const holder: { cb: TauriCallback | null } = { cb: null };
+    mockListen.mockImplementationOnce((_name, cb) => {
+      holder.cb = cb as TauriCallback;
+      return result;
+    });
+    return (payload: unknown): void => {
+      if (holder.cb === null) throw new Error('listen was never registered');
+      holder.cb({ payload });
+    };
+  }
+
+  it('delivers listened payloads to the handler and unlistens on unsubscribe', async () => {
+    const unlisten = vi.fn();
+    const fire = captureListen(Promise.resolve(unlisten));
+
+    const handler = vi.fn();
+    const off = getBridge().on('llm:delta', handler);
+    await Promise.resolve();
+    fire({ sessionId: 1, delta: 'hi' });
+    expect(handler).toHaveBeenCalledWith({ sessionId: 1, delta: 'hi' });
+
+    off();
+    expect(unlisten).toHaveBeenCalledTimes(1);
+    fire({ sessionId: 1, delta: 'late' });
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+
+  it('unsubscribing before listen resolves still detaches', async () => {
+    let resolveListen!: (un: () => void) => void;
+    const unlisten = vi.fn();
+    const handler = vi.fn();
+    const fire = captureListen(
+      new Promise<() => void>((r) => {
+        resolveListen = r;
+      }),
+    );
+
+    const off = getBridge().on('llm:delta', handler);
+    off(); // torn down before the Tauri registration finished
+    resolveListen(unlisten);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(unlisten).toHaveBeenCalledTimes(1);
+    fire({ sessionId: 1, delta: 'ghost' });
+    expect(handler).not.toHaveBeenCalled();
+  });
+});
+
+describe('test seam', () => {
+  it('setBridge replaces what getBridge returns', () => {
+    const fake = { marker: true } as unknown as Bridge;
+    setBridge(fake);
+    expect(getBridge()).toBe(fake);
+  });
+});
