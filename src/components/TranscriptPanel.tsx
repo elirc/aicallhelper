@@ -1,3 +1,5 @@
+import { memo } from 'react';
+
 interface TranscriptPanelProps {
   /** The viewed entry's question — live during recording, final afterwards. */
   question: string;
@@ -5,7 +7,7 @@ interface TranscriptPanelProps {
 }
 
 /** "Question heard": the live transcript so the user can see the STT keeping up. */
-export function TranscriptPanel({ question, recording }: TranscriptPanelProps) {
+export const TranscriptPanel = memo(function TranscriptPanel({ question, recording }: TranscriptPanelProps) {
   return (
     <section className="panel transcript-panel">
       <div className="panel-head">
@@ -27,4 +29,4 @@ export function TranscriptPanel({ question, recording }: TranscriptPanelProps) {
       </div>
     </section>
   );
-}
+});

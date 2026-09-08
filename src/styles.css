@@ -617,3 +617,9 @@ textarea::placeholder {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* Optional preparation content stays compact in the desktop window. */
+.ask-section { display: flex; flex-direction: column; gap: 8px; }
+.practice-toggle { display: flex; justify-content: space-between; align-items: center; gap: 8px; width: 100%; background: transparent; border: 1px solid var(--border); padding: 8px 10px; text-align: left; font-size: 12px; }
+.practice-toggle:hover, .practice-toggle[aria-expanded='true'] { background: var(--bg-raised); border-color: var(--accent-text); }
+.practice-toggle-note { color: var(--text-dim); font-size: 11px; text-align: right; }

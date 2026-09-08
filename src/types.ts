@@ -34,7 +34,13 @@ export type Envelope<T> = { ok: true; value: T } | { ok: false; error: AppError 
 
 export type SessionId = number;
 
-export type LlmProviderKind = 'anthropic' | 'groq';
+export type LlmProviderKind = 'anthropic' | 'groq' | 'local';
+export interface LocalVoiceStatus {
+  ollamaRunning: boolean;
+  modelAvailable: boolean;
+  speechReady: boolean;
+}
+
 export type AnswerStyle = 'brief' | 'balanced' | 'detailed';
 
 /** All measured from the instant Stop was requested (§3). */

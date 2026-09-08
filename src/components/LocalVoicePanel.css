@@ -1,0 +1,19 @@
+.local-voice-panel {
+  padding: 14px;
+  border: 1px solid #366b5c;
+  border-radius: 10px;
+  background: #18322c;
+  font-size: 13px;
+  line-height: 1.55;
+}
+.local-voice-panel h2 { margin: 0 0 8px; font-size: 16px; }
+.local-voice-panel p { margin: 8px 0; }
+.local-service-list { padding-left: 19px; }
+.local-service-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.local-voice-panel summary { cursor: pointer; }
+.local-setup-command { display: block; padding: 8px; background: #121c1a; overflow-wrap: anywhere; }
+.local-mode-banner { padding: 9px 12px; border: 1px solid #366b5c; border-radius: 8px; font-size: 12px; line-height: 1.5; }
+.local-mode-banner strong { color: #9ee3c2; }
+.local-mode-banner p { margin: 2px 0 6px; }
+
+.field[hidden] { display: none; }

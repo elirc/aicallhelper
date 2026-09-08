@@ -7,6 +7,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import type {
   Envelope,
+  LocalVoiceStatus,
   EventMap,
   EventName,
   SessionId,
@@ -39,6 +40,14 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<Env
       error: { code: 'internal', message: err instanceof Error ? err.message : String(err) },
     };
   }
+}
+
+export function checkLocalVoice(): Promise<Envelope<LocalVoiceStatus>> {
+  return call('local_voice_status');
+}
+
+export function prepareLocalVoice(): Promise<Envelope<LocalVoiceStatus>> {
+  return call('prepare_local_voice');
 }
 
 function createTauriBridge(): Bridge {

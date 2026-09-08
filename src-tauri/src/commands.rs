@@ -13,6 +13,8 @@ use app_core::audio::AudioCapture;
 use app_core::error::{no_llm_key_message, ErrorCode, MSG_NO_STT_KEY};
 use app_core::llm::anthropic::AnthropicProvider;
 use app_core::llm::groq::GroqProvider;
+use app_core::llm::local::LocalProvider;
+use app_core::stt::{SttConnector, local::LocalConnector};
 use app_core::llm::{build_system_prompt, AnswerRequest, LlmProvider, LlmProviderKind, Profile};
 use app_core::session::{limits, SessionDeps, SessionId, StopOutcome};
 use app_core::store::{Settings, SettingsPatch, SettingsView};
@@ -115,17 +117,13 @@ async fn start_session_inner(app: &AppHandle) -> Result<SessionId, AppError> {
 
     // Both keys are proven present BEFORE anything opens (§4): failing here
     // costs nothing, failing after the socket is up costs the user a recording.
-    let deepgram_key = present(settings.deepgram_key.as_deref())
-        .ok_or_else(|| AppError::new(ErrorCode::NoSttKey, MSG_NO_STT_KEY))?
-        .to_string();
-    let llm_key = present(settings.active_llm_key())
-        .ok_or_else(|| {
-            AppError::new(
-                ErrorCode::NoLlmKey,
-                no_llm_key_message(settings.llm_provider.label()),
-            )
-        })?
-        .to_string();
+    let deepgram_key = if settings.llm_provider == LlmProviderKind::Local {
+        String::new()
+    } else {
+        present(settings.deepgram_key.as_deref())
+            .ok_or_else(|| AppError::new(ErrorCode::NoSttKey, MSG_NO_STT_KEY))?.to_string()
+    };
+    let llm_key = required_llm_key(&settings)?;
 
     // Deps are built fresh from current settings per session, so a settings
     // change takes effect on the next recording without any restart.
@@ -219,14 +217,7 @@ async fn ask_inner(app: &AppHandle, text: String) -> Result<SessionId, AppError>
     let state = app.state::<AppState>();
     let settings: Settings = lock(&state.settings).get().clone();
 
-    let llm_key = present(settings.active_llm_key())
-        .ok_or_else(|| {
-            AppError::new(
-                ErrorCode::NoLlmKey,
-                no_llm_key_message(settings.llm_provider.label()),
-            )
-        })?
-        .to_string();
+    let llm_key = required_llm_key(&settings)?;
 
     // Ask supersedes whatever was live; the old session's capture would
     // otherwise keep the loopback device open feeding frames the machine
@@ -306,13 +297,25 @@ fn build_deps(
     let llm: Arc<dyn LlmProvider> = match settings.llm_provider {
         LlmProviderKind::Anthropic => Arc::new(AnthropicProvider::new(llm_key)),
         LlmProviderKind::Groq => Arc::new(GroqProvider::new(llm_key)),
+        LlmProviderKind::Local => Arc::new(LocalProvider),
+    };
+    let stt: Arc<dyn SttConnector> = if settings.llm_provider == LlmProviderKind::Local {
+        Arc::new(LocalConnector)
+    } else {
+        Arc::new(DeepgramConnector::new(deepgram_key))
     };
     SessionDeps {
-        stt: Arc::new(DeepgramConnector::new(deepgram_key)),
+        stt,
         llm,
         answer_request: AnswerRequest::new(system),
         events: Arc::new(TauriEventSink::new(app.clone())),
     }
+}
+
+fn required_llm_key(settings: &Settings) -> Result<String, AppError> {
+    if settings.llm_provider == LlmProviderKind::Local { return Ok(String::new()); }
+    present(settings.active_llm_key()).map(str::to_owned)
+        .ok_or_else(|| AppError::new(ErrorCode::NoLlmKey, no_llm_key_message(settings.llm_provider.label())))
 }
 
 fn present(key: Option<&str>) -> Option<&str> {
@@ -323,6 +326,14 @@ fn present(key: Option<&str>) -> Option<&str> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn local_answers_need_no_cloud_keys() {
+        let mut settings = Settings::default();
+        assert!(required_llm_key(&settings).is_err());
+        settings.llm_provider = LlmProviderKind::Local;
+        assert_eq!(required_llm_key(&settings).unwrap(), "");
+    }
 
     // --- envelope wire shape: the frontend destructures these exact keys ---
 

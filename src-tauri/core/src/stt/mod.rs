@@ -1,6 +1,7 @@
 //! Speech-to-text contract and the Deepgram implementation.
 
 pub mod deepgram;
+pub mod local;
 pub mod frame;
 
 use async_trait::async_trait;

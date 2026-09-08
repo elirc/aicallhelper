@@ -1,4 +1,6 @@
 node_modules/
+.local-voice/
+__pycache__/
 dist/
 src-tauri/target/
 *.local

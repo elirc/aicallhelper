@@ -1,3 +1,5 @@
+// Compile optional views during test setup, before timed UI interactions.
+import './SettingsView';
 /**
  * Integration: the REAL useSession hook and real views, driven through a
  * FakeBridge installed with setBridge. Core events are emitted exactly as the
@@ -197,11 +199,13 @@ describe('style chips', () => {
     // Core coerces the value: the user clicks Brief but detailed persists.
     bridge.setSettings.mockResolvedValue(ok({ ...bridge.settings, answerStyle: 'detailed' }));
     await renderApp();
+    const statusCallsBefore = bridge.hotkeyStatus.mock.calls.length;
     await user.click(screen.getByRole('button', { name: 'Brief' }));
     await waitFor(() =>
       expect(screen.getByRole('button', { name: 'Detailed' })).toHaveAttribute('aria-pressed', 'true')
     );
     expect(screen.getByRole('button', { name: 'Brief' })).toHaveAttribute('aria-pressed', 'false');
+    expect(bridge.hotkeyStatus.mock.calls.length).toBe(statusCallsBefore);
   });
 });
 
@@ -210,7 +214,7 @@ describe('settings round trip through App', () => {
     const user = userEvent.setup();
     await renderApp();
     await user.click(screen.getByRole('button', { name: 'Settings' }));
-    await user.type(screen.getByLabelText('Deepgram API key'), 'dg_new');
+    await user.type(await screen.findByLabelText('Deepgram API key'), 'dg_new');
     const statusCallsBefore = bridge.hotkeyStatus.mock.calls.length;
     await user.click(screen.getByRole('button', { name: 'Save' }));
     await screen.findByText('Saved ✓');

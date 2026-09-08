@@ -61,6 +61,7 @@ impl Settings {
         match self.llm_provider {
             LlmProviderKind::Anthropic => self.anthropic_key.as_deref(),
             LlmProviderKind::Groq => self.groq_key.as_deref(),
+            LlmProviderKind::Local => None,
         }
     }
 

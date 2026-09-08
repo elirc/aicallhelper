@@ -257,3 +257,25 @@ order. The individual documents:
 - [`docs/IDEAS.md`](docs/IDEAS.md) — the roadmap: ranked future features,
   feasibility sketched against this architecture, and the trap version of
   each one not to build.
+
+## Interview preparation
+
+Expand **Interview prep** below the question field to browse 12 practice
+questions across Introduction, Behavioral, Technical, and Leadership topics.
+Search or filter the library, then select a question to place it in the input.
+You can edit it before pressing **Ask**; browsing and selecting a question do
+not call an AI provider.
+
+The panel also includes three answer frameworks, a pre-call checklist, and
+questions to ask the interviewer. These guides are bundled locally and work
+without API keys. Generating answers still requires a configured answer provider.
+
+Settings and the practice library load on demand. Settings starts loading when
+you hover or focus its button, and practice styles load with the library.
+Unchanged transcript, answer, and question-input panels skip parent-driven
+renders during recording updates. A pending typed question disables the input
+and Ask action until accepted or rejected, preserving failed drafts for retry.
+
+## Free local voice mode
+
+Select **Free local voice** in Settings to test with Ollama Qwen3.5 2B and Moonshine English speech, without API keys or usage fees. See [setup, limitations and test steps](docs/FREE_VOICE_MODE.md).

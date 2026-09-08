@@ -13,6 +13,7 @@ import { TranscriptPanel } from '../components/TranscriptPanel';
 import { AnswerPanel } from '../components/AnswerPanel';
 import { ErrorBox } from '../components/ErrorBox';
 import { HistoryBar } from '../components/HistoryBar';
+import '../components/LocalVoicePanel.css';
 
 interface MainViewProps {
   session: SessionApi;
@@ -20,6 +21,7 @@ interface MainViewProps {
   settings: Settings | null;
   hotkey: HotkeyStatus | null;
   onOpenSettings(): void;
+  onPrepareSettings?(): void;
   /** Persists the style; the caller updates `settings` from the save's response. */
   onSelectStyle(style: AnswerStyle): Promise<Envelope<Settings>>;
   /** Owned by App so it can restore focus here when Settings closes. */
@@ -34,7 +36,7 @@ interface MainViewProps {
  */
 const ANNOUNCEMENT_CLEAR_MS = 1500;
 
-export function MainView({ session, settings, hotkey, onOpenSettings, onSelectStyle, gearRef }: MainViewProps) {
+export function MainView({ session, settings, hotkey, onOpenSettings, onPrepareSettings, onSelectStyle, gearRef }: MainViewProps) {
   const recordRef = useRef<HTMLButtonElement>(null);
   const [announcement, setAnnouncement] = useState('');
   const announcementTimerRef = useRef<number | null>(null);
@@ -73,7 +75,7 @@ export function MainView({ session, settings, hotkey, onOpenSettings, onSelectSt
   // First-run nudge keys off the SELECTED provider: a missing Groq key is not
   // a problem while the Anthropic preset is chosen.
   const firstRun =
-    settings != null &&
+    settings != null && settings.llmProvider !== 'local' &&
     (!settings.hasDeepgramKey ||
       (settings.llmProvider === 'anthropic' && !settings.hasAnthropicKey) ||
       (settings.llmProvider === 'groq' && !settings.hasGroqKey));
@@ -115,10 +117,20 @@ export function MainView({ session, settings, hotkey, onOpenSettings, onSelectSt
           // load resolves would risk saving a form built from nothing.
           disabled={settings == null}
           onClick={onOpenSettings}
+          onPointerEnter={onPrepareSettings}
+          onFocus={onPrepareSettings}
         >
           <span aria-hidden="true">⚙</span>
         </button>
       </header>
+
+      {settings?.llmProvider === 'local' && (
+        <aside className="local-mode-banner" aria-label="Current mode">
+          <strong>Free local voice · no API fees</strong>
+          <p>English system audio · CPU answers may take longer.</p>
+          <button type="button" className="ghost-button" onClick={onOpenSettings}>Local setup</button>
+        </aside>
+      )}
 
       <StatusLine
         state={session.state}

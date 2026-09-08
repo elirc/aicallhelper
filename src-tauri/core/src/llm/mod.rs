@@ -4,6 +4,7 @@
 pub mod anthropic;
 pub mod groq;
 pub mod http;
+pub mod local;
 pub mod prompt;
 pub mod retry;
 pub mod sse;
@@ -30,6 +31,7 @@ pub enum LlmProviderKind {
     #[default]
     Anthropic,
     Groq,
+    Local,
 }
 
 impl LlmProviderKind {
@@ -37,6 +39,7 @@ impl LlmProviderKind {
         match self {
             LlmProviderKind::Anthropic => "anthropic",
             LlmProviderKind::Groq => "groq",
+            LlmProviderKind::Local => "local",
         }
     }
 
@@ -45,6 +48,7 @@ impl LlmProviderKind {
     pub fn parse_or_default(raw: &str) -> Self {
         match raw {
             "groq" => LlmProviderKind::Groq,
+            "local" => LlmProviderKind::Local,
             _ => LlmProviderKind::Anthropic,
         }
     }
@@ -54,6 +58,7 @@ impl LlmProviderKind {
         match self {
             LlmProviderKind::Anthropic => "Anthropic",
             LlmProviderKind::Groq => "Groq",
+            LlmProviderKind::Local => "Free local",
         }
     }
 }

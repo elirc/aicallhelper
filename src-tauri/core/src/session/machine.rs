@@ -692,8 +692,9 @@ async fn run_answer(
 
     let mut answer = llm.stream_answer(&request, sink, cancel.clone());
 
-    let first_token_deadline = stopped_at + limits::LLM_FIRST_TOKEN;
-    let total_deadline = stopped_at + limits::LLM_TOTAL;
+    let local = llm.kind() == crate::llm::LlmProviderKind::Local;
+    let first_token_deadline = stopped_at + if local { limits::LOCAL_FIRST_TOKEN } else { limits::LLM_FIRST_TOKEN };
+    let total_deadline = stopped_at + if local { limits::LOCAL_TOTAL } else { limits::LLM_TOTAL };
     let mut first_token_at: Option<Instant> = None;
     let mut first_armed = true;
 

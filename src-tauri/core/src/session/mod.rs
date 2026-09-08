@@ -138,6 +138,9 @@ pub mod limits {
     pub const LLM_FIRST_TOKEN: Duration = Duration::from_secs(10);
     /// Stop -> answer complete.
     pub const LLM_TOTAL: Duration = Duration::from_secs(60);
+    /// CPU inference can take longer; cloud limits remain unchanged.
+    pub const LOCAL_FIRST_TOKEN: Duration = Duration::from_secs(90);
+    pub const LOCAL_TOTAL: Duration = Duration::from_secs(300);
     /// Recording hard cap; auto-stops and answers normally.
     pub const MAX_RECORDING: Duration = Duration::from_secs(120);
 

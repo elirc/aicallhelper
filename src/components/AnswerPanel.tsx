@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { AppError } from '../types';
 import type { HistoryEntry } from '../state/useSession';
 import { formatLatency, latencyTitle } from '../format';
@@ -29,7 +29,7 @@ interface AnswerPanelProps {
   onCopyError(e: AppError): void;
 }
 
-export function AnswerPanel({ viewed, streaming, canRegenerate, onRegenerate, onCopyError }: AnswerPanelProps) {
+export const AnswerPanel = memo(function AnswerPanel({ viewed, streaming, canRegenerate, onRegenerate, onCopyError }: AnswerPanelProps) {
   const source = viewed?.answer ?? '';
   const entryKey = viewed?.key ?? null;
 
@@ -224,4 +224,4 @@ export function AnswerPanel({ viewed, streaming, canRegenerate, onRegenerate, on
       </span>
     </section>
   );
-}
+});

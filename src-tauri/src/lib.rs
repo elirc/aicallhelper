@@ -8,6 +8,7 @@ mod commands;
 mod events;
 mod hotkey;
 mod logging;
+mod local_voice;
 mod state;
 mod window;
 
@@ -109,6 +110,8 @@ pub fn run() {
         .on_window_event(window::handle_window_event)
         .invoke_handler(tauri::generate_handler![
             commands::get_settings,
+            local_voice::local_voice_status,
+            local_voice::prepare_local_voice,
             commands::set_settings,
             commands::start_session,
             commands::stop_session,

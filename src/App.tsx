@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import type { MutableRefObject } from 'react';
 import type { AnswerStyle, Envelope, EventMap, EventName, SettingsPatch, SettingsView as Settings } from './types';
 import { getBridge, setBridge } from './bridge';
@@ -6,7 +6,10 @@ import type { Bridge } from './bridge';
 import { useSession } from './state/useSession';
 import type { HotkeyStatus } from './components/hotkey';
 import { MainView } from './views/MainView';
-import { SettingsView } from './views/SettingsView';
+import { DeferredView } from './components/DeferredView';
+
+const loadSettingsView = () => import('./views/SettingsView');
+const SettingsView = lazy(() => loadSettingsView().then((module) => ({ default: module.SettingsView })));
 
 /** Bridges that are already hotkey-gated; re-wrapping would stack filters. */
 const gatedBridges = new WeakSet<Bridge>();
@@ -98,8 +101,10 @@ export default function App() {
       setSettings(env.value);
       // A saved hotkey may have gained or lost its OS registration; the chip
       // and the taken-notice must reflect the new reality, not the old one.
-      const hk = await getBridge().hotkeyStatus();
-      if (hk.ok) setHotkey(hk.value);
+      if (patch.hotkey !== undefined) {
+        const hk = await getBridge().hotkeyStatus();
+        if (hk.ok) setHotkey(hk.value);
+      }
     }
     return env;
   }, []);
@@ -109,8 +114,22 @@ export default function App() {
     [applySettings]
   );
 
+  const closeSettings = useCallback(() => setSettingsOpen(false), []);
+  const prepareSettings = useCallback(() => { void loadSettingsView().catch(() => undefined); }, []);
+
   if (settingsOpen && settings != null) {
-    return <SettingsView settings={settings} onSave={applySettings} onBack={() => setSettingsOpen(false)} />;
+    return (
+      <DeferredView onClose={closeSettings}>
+        <Suspense fallback={
+          <div className="app">
+            <p role="status">Loading settings…</p>
+            <button type="button" className="ghost-button" onClick={closeSettings}>Back to assistant</button>
+          </div>
+        }>
+          <SettingsView settings={settings} onSave={applySettings} onBack={closeSettings} />
+        </Suspense>
+      </DeferredView>
+    );
   }
 
   return (
@@ -120,6 +139,7 @@ export default function App() {
       hotkey={hotkey}
       gearRef={gearRef}
       onOpenSettings={() => setSettingsOpen(true)}
+      onPrepareSettings={prepareSettings}
       onSelectStyle={selectStyle}
     />
   );

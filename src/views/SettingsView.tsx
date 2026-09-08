@@ -9,6 +9,8 @@ import type {
   SettingsView as Settings,
 } from '../types';
 import { ErrorBox } from '../components/ErrorBox';
+import { LocalVoicePanel } from '../components/LocalVoicePanel';
+import '../components/LocalVoicePanel.css';
 
 /** Mirrors the core's default accelerator; shown as the hotkey placeholder. */
 const DEFAULT_HOTKEY = 'CommandOrControl+Shift+Space';
@@ -108,7 +110,7 @@ export function SettingsView({ settings, onSave, onBack }: SettingsViewProps) {
         </h1>
       </header>
       <form className="settings-form" onSubmit={(e) => void save(e)}>
-        <div className="field">
+        <div className="field" hidden={llmProvider === 'local'}>
           <label className="field-label" htmlFor="set-deepgram">
             Deepgram API key
           </label>
@@ -133,10 +135,13 @@ export function SettingsView({ settings, onSave, onBack }: SettingsViewProps) {
           >
             <option value="anthropic">Claude Haiku 4.5 (recommended)</option>
             <option value="groq">Groq GPT-OSS 120B (fastest)</option>
+            <option value="local">Free local voice (Qwen3.5 2B + Moonshine)</option>
           </select>
         </div>
 
-        <div className="field">
+        {llmProvider === 'local' && <LocalVoicePanel />}
+
+        <div className="field" hidden={llmProvider === 'local'}>
           <label className="field-label" htmlFor="set-anthropic">
             Anthropic API key
           </label>
@@ -150,7 +155,7 @@ export function SettingsView({ settings, onSave, onBack }: SettingsViewProps) {
           />
         </div>
 
-        <div className="field">
+        <div className="field" hidden={llmProvider === 'local'}>
           <label className="field-label" htmlFor="set-groq">
             Groq API key (only for the Groq preset)
           </label>
