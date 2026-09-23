@@ -1,6 +1,14 @@
 //! Free, loopback-only Ollama answers. Never uses keys or cloud fallbacks.
-use super::{AnswerRequest, LlmProvider, LlmProviderKind, LlmSink};
+//!
+//! The R2 completion contract applies here exactly as it does to the cloud
+//! pair: the `done: true` frame is the protocol terminator (nothing after it
+//! is read), `done_reason` is metadata (`length` = cut short), an error frame
+//! or an end of stream before `done` keeps the streamed text and fails, and a
+//! `done` with no usable text is an explicit failure.
+use super::prompt::request_input_bytes;
+use super::{Answer, AnswerRequest, LlmProvider, LlmProviderKind, LlmSink, StopReason};
 use crate::error::{AppError, AppResult, ErrorCode};
+use crate::session::AnswerLimits;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -14,6 +22,13 @@ pub const MODEL: &str = "qwen3.5:2b";
 pub const ORIGIN: &str = "http://127.0.0.1:11434";
 pub const MAX_INPUT_BYTES: usize = 7000;
 const MAX_FRAME_BYTES: usize = 256 * 1024;
+
+/// Shown when the cached prefix plus the question would not fit the local
+/// context (PROF-08). Names every profile field that counts toward the cap:
+/// after call profiles, focus and extra instructions ride in the prefix too,
+/// and a message that only mentioned the resume sent users trimming the
+/// wrong field.
+const OVERSIZE_MESSAGE: &str = "Free local mode supports about 7 KB of combined instructions, profile (resume, job description, focus, extra instructions) and question. Shorten the active profile in Settings or use a cloud model.";
 
 pub fn client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
@@ -46,14 +61,23 @@ fn local_error(message: impl Into<String>) -> AppError {
     AppError::new(ErrorCode::LlmHttp, message)
 }
 
+/// The refusal for a request over `MAX_INPUT_BYTES`. Public so the shell's
+/// pre-checks (before recording, before a typed ask) refuse with the same
+/// code and the same words as this gate.
+pub fn oversize_error() -> AppError {
+    local_error(OVERSIZE_MESSAGE)
+}
+
 pub fn request_body(req: &AnswerRequest) -> AppResult<Value> {
+    // Conservatively budget by UTF-8 bytes so even non-English input fits.
+    // Do not silently truncate a resume or the question. The count is the
+    // same function the Settings preview uses (R4), so the preview and this
+    // gate cannot disagree; this gate stays the authority.
+    if request_input_bytes(&req.system, &req.transcript) > MAX_INPUT_BYTES {
+        return Err(oversize_error());
+    }
     let system = req.system.joined();
     let user = req.user_message();
-    // Conservatively budget by UTF-8 bytes so even non-English input fits.
-    // Do not silently truncate a resume or the question.
-    if system.len() + user.len() > MAX_INPUT_BYTES {
-        return Err(local_error("Free local mode supports about 7 KB of combined instructions, resume, job description and question. Shorten the profile in Settings or use a cloud model."));
-    }
     Ok(json!({
         "model": MODEL, "stream": true, "think": false, "keep_alive": "10m",
         "options": { "num_ctx": 8192, "num_predict": 512, "num_thread": 4, "temperature": 0.3 },
@@ -93,7 +117,9 @@ impl Ndjson {
     }
 }
 
-fn apply(frame: &Value, sink: &dyn LlmSink, answer: &mut String) -> AppResult<bool> {
+/// Interpret one frame. Returns the stop reason once the `done` frame (the
+/// protocol terminator) arrives, `None` while the answer is still streaming.
+fn apply(frame: &Value, sink: &dyn LlmSink, answer: &mut String) -> AppResult<Option<StopReason>> {
     if frame.get("error").is_some() {
         // Avoid exposing unbounded service internals in the UI.
         return Err(local_error("Ollama could not generate an answer. Check that qwen3.5:2b is installed, then start and warm free mode in Settings."));
@@ -105,7 +131,49 @@ fn apply(frame: &Value, sink: &dyn LlmSink, answer: &mut String) -> AppResult<bo
         }
     }
     // /message/thinking is intentionally never emitted.
-    Ok(frame.get("done").and_then(Value::as_bool) == Some(true))
+    if frame.get("done").and_then(Value::as_bool) == Some(true) {
+        // `done_reason` says why generation stopped; `length` is the
+        // `num_predict` cap — kept and labelled "cut short", not failed.
+        let reason = frame.get("done_reason").and_then(Value::as_str);
+        return Ok(Some(StopReason::from_provider(reason)));
+    }
+    Ok(None)
+}
+
+/// One answer's decode state: frames in, the finished answer out once the
+/// `done` frame arrives. Kept apart from the HTTP loop so the completion
+/// contract is testable without an Ollama server.
+#[derive(Default)]
+struct LocalStream {
+    decoder: Ndjson,
+    answer: String,
+}
+
+impl LocalStream {
+    /// Feed one HTTP chunk. `Some` once the terminator arrived — the caller
+    /// stops reading there, and any frame after `done` in the same chunk is
+    /// never applied.
+    fn push(&mut self, chunk: &[u8], sink: &dyn LlmSink) -> AppResult<Option<Answer>> {
+        for frame in self.decoder.push(chunk)? {
+            if let Some(stop) = apply(&frame, sink, &mut self.answer)? {
+                return finished(std::mem::take(&mut self.answer), stop).map(Some);
+            }
+        }
+        Ok(None)
+    }
+
+    /// End of stream: flush a final unterminated frame, and fail if the
+    /// terminator never came.
+    fn finish(&mut self, sink: &dyn LlmSink) -> AppResult<Answer> {
+        for frame in self.decoder.finish()? {
+            if let Some(stop) = apply(&frame, sink, &mut self.answer)? {
+                return finished(std::mem::take(&mut self.answer), stop);
+            }
+        }
+        Err(local_error(
+            "Ollama stopped before finishing the answer, so it is incomplete. Try again.",
+        ))
+    }
 }
 
 #[async_trait]
@@ -115,7 +183,7 @@ impl LlmProvider for LocalProvider {
         req: &AnswerRequest,
         sink: Arc<dyn LlmSink>,
         cancel: CancellationToken,
-    ) -> AppResult<String> {
+    ) -> AppResult<Answer> {
         let body = request_body(req)?;
         let work = async {
             let response = client()
@@ -132,26 +200,16 @@ impl LlmProvider for LocalProvider {
                 return Err(http_failure(response.status().as_u16()));
             }
             let mut stream = response.bytes_stream();
-            let mut decoder = Ndjson::default();
-            let mut answer = String::new();
+            let mut decode = LocalStream::default();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|_| {
                     local_error("The local answer connection ended unexpectedly. Try again.")
                 })?;
-                for frame in decoder.push(&chunk)? {
-                    if apply(&frame, &*sink, &mut answer)? {
-                        return nonempty(answer);
-                    }
+                if let Some(answer) = decode.push(&chunk, &*sink)? {
+                    return Ok(answer);
                 }
             }
-            for frame in decoder.finish()? {
-                if apply(&frame, &*sink, &mut answer)? {
-                    return nonempty(answer);
-                }
-            }
-            Err(local_error(
-                "Ollama stopped before finishing the answer. Try again.",
-            ))
+            decode.finish(&*sink)
         };
         tokio::select! {
             biased;
@@ -166,15 +224,22 @@ impl LlmProvider for LocalProvider {
     fn kind(&self) -> LlmProviderKind {
         LlmProviderKind::Local
     }
+    /// CPU inference (§3): a 2B model on a laptop can spend longer than the
+    /// whole 10 s cloud first-token cap just ingesting the prompt.
+    fn answer_limits(&self) -> AnswerLimits {
+        AnswerLimits::LOCAL
+    }
 }
 
-fn nonempty(answer: String) -> AppResult<String> {
+/// The terminator arrived: usable text is an answer, none is an explicit
+/// failure (R2) — never a blank success.
+fn finished(answer: String, stop_reason: StopReason) -> AppResult<Answer> {
     if answer.trim().is_empty() {
         Err(local_error(
             "The local model returned an empty answer. Try again.",
         ))
     } else {
-        Ok(answer)
+        Ok(Answer { text: answer, stop_reason })
     }
 }
 
@@ -229,9 +294,9 @@ mod tests {
         frames.extend(d.finish().unwrap());
         let sink = Sink::default();
         let mut answer = String::new();
-        assert!(!apply(&frames[0], &sink, &mut answer).unwrap());
-        assert!(!apply(&frames[1], &sink, &mut answer).unwrap());
-        assert!(apply(&frames[2], &sink, &mut answer).unwrap());
+        assert_eq!(apply(&frames[0], &sink, &mut answer).unwrap(), None);
+        assert_eq!(apply(&frames[1], &sink, &mut answer).unwrap(), None);
+        assert_eq!(apply(&frames[2], &sink, &mut answer).unwrap(), Some(StopReason::Complete));
         assert_eq!(answer, "café");
         assert_eq!(answer, *sink.0.lock().unwrap());
     }
@@ -248,6 +313,7 @@ mod tests {
             Profile {
                 resume: "My experience",
                 job_description: "My role",
+                ..Default::default()
             },
             AnswerStyle::Detailed,
         ))
@@ -260,6 +326,65 @@ mod tests {
             .unwrap()
             .contains("My experience"));
         r.transcript = "é".repeat(MAX_INPUT_BYTES);
-        assert!(request_body(&r).is_err());
+        let err = request_body(&r).expect_err("over the byte cap must refuse, never truncate");
+        // Pinned verbatim (PROF-08): the text tells the user which fields
+        // count and where to shorten them; a paraphrase that dropped a field
+        // would send them trimming the wrong thing.
+        assert_eq!(
+            err.message,
+            "Free local mode supports about 7 KB of combined instructions, profile (resume, job description, focus, extra instructions) and question. Shorten the active profile in Settings or use a cloud model."
+        );
+        assert_eq!(err.code, ErrorCode::LlmHttp);
+    }
+    #[test]
+    fn local_provider_answers_on_the_local_deadlines() {
+        // Ollama on the CPU needs minutes where the cloud gets seconds; on the
+        // trait's cloud default every local answer would time out at 10 s.
+        assert_eq!(LocalProvider.answer_limits(), AnswerLimits::LOCAL);
+        assert_eq!(LocalProvider.kind(), LlmProviderKind::Local);
+    }
+
+    #[test]
+    fn the_done_frame_ends_the_answer_and_nothing_after_it_is_read() {
+        // R2 applied to NDJSON: `done` is the terminator; a frame after it in
+        // the same chunk must not paint, and `done_reason: length` is kept as
+        // "cut short" rather than failed.
+        let wire = "{\"message\":{\"content\":\"Short\"}}\n{\"done\":true,\"done_reason\":\"length\"}\n{\"message\":{\"content\":\" EXTRA\"}}\n";
+        let sink = Sink::default();
+        let mut s = LocalStream::default();
+        let answer = s.push(wire.as_bytes(), &sink).unwrap().expect("done arrived");
+        assert_eq!(answer.text, "Short");
+        assert_eq!(answer.stop_reason, StopReason::TokenLimit);
+        assert_eq!(*sink.0.lock().unwrap(), "Short");
+    }
+
+    #[test]
+    fn eof_before_done_fails_but_the_streamed_text_was_delivered() {
+        let sink = Sink::default();
+        let mut s = LocalStream::default();
+        assert!(s.push(b"{\"message\":{\"content\":\"Half\"}}\n", &sink).unwrap().is_none());
+        let err = s.finish(&sink).unwrap_err();
+        assert!(err.message.contains("incomplete"), "{}", err.message);
+        assert_eq!(*sink.0.lock().unwrap(), "Half");
+    }
+
+    #[test]
+    fn a_done_frame_without_text_is_an_explicit_failure() {
+        let sink = Sink::default();
+        let mut s = LocalStream::default();
+        let err = s.push(b"{\"message\":{\"content\":\"\"}}\n{\"done\":true}\n", &sink).unwrap_err();
+        assert!(err.message.contains("empty answer"), "{}", err.message);
+    }
+
+    #[test]
+    fn an_error_frame_after_partial_output_fails_and_keeps_the_text() {
+        let sink = Sink::default();
+        let mut s = LocalStream::default();
+        let err = s
+            .push(b"{\"message\":{\"content\":\"Half\"}}\n{\"error\":\"out of memory\"}\n", &sink)
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::LlmHttp);
+        assert!(!err.message.contains("out of memory"), "service internals stay out of the UI");
+        assert_eq!(*sink.0.lock().unwrap(), "Half");
     }
 }

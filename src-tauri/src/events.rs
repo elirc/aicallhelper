@@ -63,6 +63,7 @@ fn release_capture(app: &AppHandle, session_id: SessionId) {
 mod tests {
     use super::*;
     use app_core::error::{AppError, ErrorCode};
+    use app_core::llm::StopReason;
     use app_core::session::Metrics;
     use serde_json::json;
 
@@ -91,12 +92,13 @@ mod tests {
     }
 
     #[test]
-    fn llm_done_carries_camel_case_metrics() {
+    fn llm_done_carries_camel_case_metrics_and_the_stop_reason() {
         let (name, payload) = wire_payload(&SessionEvent::LlmDone {
             session_id: 7,
             transcript: "q".into(),
             answer: "a".into(),
             metrics: Metrics::finish(10, Some(20), 30),
+            stop_reason: StopReason::TokenLimit,
         });
         assert_eq!(name, "llm:done");
         assert_eq!(
@@ -105,7 +107,8 @@ mod tests {
                 "sessionId": 7,
                 "transcript": "q",
                 "answer": "a",
-                "metrics": { "sttFinalizeMs": 10, "firstTokenMs": 20, "totalMs": 30 }
+                "metrics": { "sttFinalizeMs": 10, "firstTokenMs": 20, "totalMs": 30 },
+                "stopReason": "token_limit"
             })
         );
     }
@@ -143,6 +146,7 @@ mod tests {
                 transcript: "t".into(),
                 answer: "a".into(),
                 metrics: Metrics::finish(1, Some(2), 3),
+                stop_reason: StopReason::Complete,
             },
             SessionEvent::SessionError { session_id: 1, error: AppError::aborted() },
             SessionEvent::AudioLevel { session_id: 1, rms: 0.0 },

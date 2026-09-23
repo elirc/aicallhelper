@@ -1,7 +1,7 @@
 import { forwardRef } from 'react';
 import type { UiState } from '../state/useSession';
 import { formatHotkey } from '../format';
-import type { HotkeyStatus } from './hotkey';
+import type { HotkeyStatus } from '../types';
 
 interface RecordButtonProps {
   state: UiState;

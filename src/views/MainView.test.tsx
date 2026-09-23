@@ -6,20 +6,25 @@ import { describe, expect, it, vi } from 'vitest';
 import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { createRef } from 'react';
-import type { AnswerStyle, Envelope, SettingsView as Settings } from '../types';
+import type { AnswerStyle, Envelope, HotkeyStatus, SettingsView as Settings } from '../types';
 import type { SessionApi } from '../state/useSession';
 import { formatDuration, formatHotkey } from '../format';
-import type { HotkeyStatus } from '../components/hotkey';
 import { MainView } from './MainView';
-import { baseSettings, err, makeEntry, makeSession, ok } from './testUtils';
+import { baseSettings, err, makeEntry, makeProfile, makeSession, ok } from './testUtils';
 
 const HK: HotkeyStatus = { accelerator: 'CommandOrControl+Shift+Space', registered: true };
 const HK_TEXT = formatHotkey(HK.accelerator);
 
+const P_A = makeProfile({ id: 'a', name: 'Backend' });
+const P_B = makeProfile({ id: 'b', name: 'Rust / systems', callType: 'sales' });
+const twoProfiles: Settings = { ...baseSettings, profiles: [P_A, P_B], activeProfileId: 'a' };
+
 interface RenderOpts {
   settings?: Settings | null;
   hotkey?: HotkeyStatus | null;
+  focusMode?: boolean;
   onSelectStyle?: (style: AnswerStyle) => Promise<Envelope<Settings>>;
+  onSelectProfile?: (id: string) => Promise<Envelope<Settings>>;
 }
 
 function renderMain(sessionOverrides: Partial<SessionApi> = {}, opts: RenderOpts = {}) {
@@ -27,27 +32,37 @@ function renderMain(sessionOverrides: Partial<SessionApi> = {}, opts: RenderOpts
   const gearRef = createRef<HTMLButtonElement>();
   const onOpenSettings = vi.fn();
   const onSelectStyle = vi.fn(opts.onSelectStyle ?? (async () => ok(baseSettings)));
+  const onSelectProfile = vi.fn(opts.onSelectProfile ?? (async () => ok(baseSettings)));
+  const onDock = vi.fn();
+  const onToggleFocus = vi.fn();
   const settings = opts.settings === undefined ? baseSettings : opts.settings;
   const hotkey = opts.hotkey === undefined ? HK : opts.hotkey;
-  const view = (s: SessionApi) => (
+  const view = (s: SessionApi, focusMode: boolean) => (
     <MainView
       session={s}
       settings={settings}
       hotkey={hotkey}
+      focusMode={focusMode}
       onOpenSettings={onOpenSettings}
       onSelectStyle={onSelectStyle}
+      onSelectProfile={onSelectProfile}
+      onDock={onDock}
+      onToggleFocus={onToggleFocus}
       gearRef={gearRef}
     />
   );
-  const utils = render(view(session));
+  const utils = render(view(session, opts.focusMode ?? false));
   return {
     ...utils,
     session,
     onOpenSettings,
     onSelectStyle,
+    onSelectProfile,
+    onDock,
+    onToggleFocus,
     rerenderSession: (o: Partial<SessionApi>) => {
       const next = makeSession(o);
-      utils.rerender(view(next));
+      utils.rerender(view(next, opts.focusMode ?? false));
       return next;
     },
   };
@@ -96,6 +111,18 @@ describe('status line', () => {
     // Anthropic selected and present; only the Groq key is missing.
     renderMain({}, { settings: { ...baseSettings, hasGroqKey: false } });
     expect(screen.getByText(/^Ready — press Record/)).toBeInTheDocument();
+  });
+
+  // Before settings load, neither "Ready" nor "First run" is known to be
+  // true; a wrong first frame that flips a moment later is what users see.
+  it('renders an empty line while settings are null, keeping the live region mounted', () => {
+    const { container } = renderMain({}, { settings: null });
+    const line = container.querySelector('.status-line');
+    expect(line).not.toBeNull();
+    expect(line).toHaveAttribute('role', 'status');
+    expect(line?.textContent).toBe('');
+    expect(screen.queryByText(/^Ready — press Record/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/First run/)).not.toBeInTheDocument();
   });
 
   it('shows Done after an answer completes cleanly', () => {
@@ -192,6 +219,13 @@ describe('recording row', () => {
     renderMain();
     expect(screen.queryByRole('meter')).not.toBeInTheDocument();
   });
+
+  // The row itself never unmounts: its reserved height is what keeps the
+  // answer from jumping when the meter appears.
+  it('keeps the row container mounted while idle', () => {
+    const { container } = renderMain();
+    expect(container.querySelector('.recording-row')).not.toBeNull();
+  });
 });
 
 describe('question heard panel', () => {
@@ -239,6 +273,72 @@ describe('question heard panel', () => {
   });
 });
 
+describe('transcript strip auto-collapse', () => {
+  const toggle = () => screen.getByRole('button', { name: /^Question heard/ });
+
+  it('stays expanded while idle with nothing heard, so the placeholder is visible', () => {
+    renderMain();
+    expect(toggle()).toHaveAttribute('aria-expanded', 'true');
+    expect(toggle()).toHaveAttribute('aria-controls', 'transcript-body');
+    expect(screen.getByText('The live transcript will appear here while you record.')).toBeVisible();
+  });
+
+  it('collapses to a one-line caption after recording ends, and expands on toggle', async () => {
+    const user = userEvent.setup();
+    const entry = makeEntry({ question: 'Tell me about a hard bug', answer: '' });
+    const { container, rerenderSession } = renderMain({ state: 'recording', history: [entry], viewed: entry });
+    expect(toggle()).toHaveAttribute('aria-expanded', 'true');
+
+    const done = makeEntry({ question: 'Tell me about a hard bug', answer: 'I once…' });
+    rerenderSession({ state: 'idle', history: [done], viewed: done });
+    expect(toggle()).toHaveAttribute('aria-expanded', 'false');
+    const body = container.querySelector('#transcript-body');
+    expect(body).toHaveAttribute('hidden');
+    // The caption lives in the head strip beside the heading — NOT inside the
+    // button, whose accessible name must stay "Question heard" rather than
+    // the whole question.
+    const head = toggle().closest('.transcript-head') as HTMLElement;
+    expect(within(head).getByText('Tell me about a hard bug')).toBeInTheDocument();
+    expect(toggle()).toHaveAccessibleName('Question heard');
+
+    await user.click(toggle());
+    expect(toggle()).toHaveAttribute('aria-expanded', 'true');
+    expect(body).not.toHaveAttribute('hidden');
+    expect(within(body as HTMLElement).getByText('Tell me about a hard bug')).toBeInTheDocument();
+  });
+
+  it('keeps "Question heard" a real heading with the disclosure button inside it', () => {
+    const done = makeEntry({ question: 'Tell me about a hard bug' });
+    renderMain({ state: 'recording', history: [done], viewed: done });
+    // A heading nested inside a button drops out of the screen reader's
+    // heading list (a button's descendants are presentational); the standard
+    // pattern is the button inside the heading. The live tag and caption are
+    // siblings, so neither leaks into the button's name.
+    const heading = screen.getByRole('heading', { level: 2, name: 'Question heard' });
+    expect(within(heading).getByRole('button', { name: 'Question heard' })).toBe(toggle());
+    expect(toggle()).toHaveAccessibleName('Question heard');
+    expect(screen.getByText('live')).toBeInTheDocument();
+  });
+
+  it('a new recording starts a fresh auto cycle after a manual expand', async () => {
+    const user = userEvent.setup();
+    const done = makeEntry({ key: 'a', question: 'First question' });
+    const { rerenderSession } = renderMain({ history: [done], viewed: done });
+    expect(toggle()).toHaveAttribute('aria-expanded', 'false');
+    await user.click(toggle());
+    expect(toggle()).toHaveAttribute('aria-expanded', 'true');
+
+    const live = makeEntry({ key: 'b', question: '', answer: '' });
+    rerenderSession({ state: 'recording', history: [done, live], viewIndex: 1, viewed: live });
+    expect(toggle()).toHaveAttribute('aria-expanded', 'true');
+
+    const second = makeEntry({ key: 'b', question: 'Second question' });
+    rerenderSession({ state: 'idle', history: [done, second], viewIndex: 1, viewed: second });
+    // The manual expand did not survive the recording: collapsed again.
+    expect(toggle()).toHaveAttribute('aria-expanded', 'false');
+  });
+});
+
 describe('ask form', () => {
   it.each(['starting', 'recording', 'finalizing'] as const)('is disabled while %s', (state) => {
     renderMain({ state });
@@ -268,6 +368,49 @@ describe('ask form', () => {
     await user.click(screen.getByRole('button', { name: 'Ask' }));
     expect(input).toHaveValue('How would you scale this?');
   });
+
+  it('offers Interview prep only for an interview profile', () => {
+    const { unmount } = renderMain({}, { settings: twoProfiles });
+    expect(screen.getByRole('button', { name: /Interview prep/ })).toBeInTheDocument();
+    unmount();
+    renderMain({}, { settings: { ...twoProfiles, activeProfileId: 'b' } });
+    expect(screen.queryByRole('button', { name: /Interview prep/ })).not.toBeInTheDocument();
+  });
+});
+
+describe('hints under the ask form', () => {
+  const TIP = `Tip: press ${HK_TEXT} from the meeting window — the answer streams here.`;
+
+  it('shows the hotkey tip only before the first answer and only with a registered hotkey', () => {
+    const { rerenderSession, unmount } = renderMain();
+    expect(screen.getByText(TIP)).toBeInTheDocument();
+    const entry = makeEntry();
+    rerenderSession({ history: [entry], viewed: entry });
+    expect(screen.queryByText(TIP)).not.toBeInTheDocument();
+    unmount();
+    renderMain({}, { hotkey: { ...HK, registered: false } });
+    expect(screen.queryByText(/^Tip: press/)).not.toBeInTheDocument();
+  });
+
+  it('warns when the active profile has neither resume nor job description', () => {
+    const bare = makeProfile({ id: 'x', name: 'Bare', resume: '  ', jobDescription: '' });
+    renderMain({}, { settings: { ...baseSettings, profiles: [bare], activeProfileId: 'x' } });
+    expect(
+      screen.getByText("No resume or job description saved for Bare — answers won't be grounded. Add them in Settings.")
+    ).toBeInTheDocument();
+  });
+
+  it('does not stack the ungrounded hint on top of the first-run nudge', () => {
+    const bare = makeProfile({ id: 'x', name: 'Bare', resume: '', jobDescription: '' });
+    renderMain({}, { settings: { ...baseSettings, profiles: [bare], activeProfileId: 'x', hasDeepgramKey: false } });
+    expect(screen.queryByText(/answers won't be grounded/)).not.toBeInTheDocument();
+    expect(screen.getByText(/First run/)).toBeInTheDocument();
+  });
+
+  it('is silent when the active profile is grounded', () => {
+    renderMain();
+    expect(screen.queryByText(/answers won't be grounded/)).not.toBeInTheDocument();
+  });
 });
 
 describe('style chips', () => {
@@ -291,6 +434,46 @@ describe('style chips', () => {
     );
     await user.click(screen.getByRole('button', { name: 'Brief' }));
     expect(session.setError).toHaveBeenCalledWith({ code: 'internal', message: 'save failed' });
+  });
+});
+
+describe('profile chips', () => {
+  it('are hidden with a single profile', () => {
+    renderMain();
+    expect(screen.queryByRole('group', { name: 'Call profile' })).not.toBeInTheDocument();
+  });
+
+  it('show one chip per profile once there are two, pressed mirroring activeProfileId', () => {
+    renderMain({}, { settings: twoProfiles });
+    const group = screen.getByRole('group', { name: 'Call profile' });
+    expect(within(group).getByRole('button', { name: 'Backend' })).toHaveAttribute('aria-pressed', 'true');
+    expect(within(group).getByRole('button', { name: 'Rust / systems' })).toHaveAttribute('aria-pressed', 'false');
+  });
+
+  it('click sends the id but the pressed chip follows the PERSISTED value, not the click', async () => {
+    const user = userEvent.setup();
+    const { onSelectProfile } = renderMain({}, { settings: twoProfiles });
+    await user.click(screen.getByRole('button', { name: 'Rust / systems' }));
+    expect(onSelectProfile).toHaveBeenCalledWith('b');
+    expect(screen.getByRole('button', { name: 'Rust / systems' })).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.getByRole('button', { name: 'Backend' })).toHaveAttribute('aria-pressed', 'true');
+  });
+
+  it('clicking the active chip is a no-op (no cache write for nothing)', async () => {
+    const user = userEvent.setup();
+    const { onSelectProfile } = renderMain({}, { settings: twoProfiles });
+    await user.click(screen.getByRole('button', { name: 'Backend' }));
+    expect(onSelectProfile).not.toHaveBeenCalled();
+  });
+
+  it('surfaces a failed switch in the error box', async () => {
+    const user = userEvent.setup();
+    const { session } = renderMain(
+      {},
+      { settings: twoProfiles, onSelectProfile: vi.fn(async () => err<Settings>('internal', 'disk full')) }
+    );
+    await user.click(screen.getByRole('button', { name: 'Rust / systems' }));
+    expect(session.setError).toHaveBeenCalledWith({ code: 'internal', message: 'disk full' });
   });
 });
 
@@ -322,6 +505,13 @@ describe('history bar', () => {
     expect(screen.getByRole('button', { name: 'Next answer' })).toBeDisabled();
     await user.click(screen.getByRole('button', { name: 'Previous answer' }));
     expect(session.viewPrev).toHaveBeenCalledTimes(1);
+  });
+
+  // §9: navigation lives in the answer panel's head, next to what it pages.
+  it('renders inside the answer panel head', () => {
+    const { container } = renderMain({ history: two, viewIndex: 1, viewed: two[1] ?? null });
+    const head = container.querySelector('.answer-panel .panel-head') as HTMLElement;
+    expect(within(head).getByRole('navigation', { name: 'Answer history' })).toBeInTheDocument();
   });
 
   it('disables prev at the oldest entry', () => {
@@ -375,6 +565,71 @@ describe('header', () => {
   it('keeps the gear disabled until settings load', () => {
     renderMain({}, { settings: null });
     expect(screen.getByRole('button', { name: 'Settings' })).toBeDisabled();
+  });
+
+  it('docks to the camera from the header button', async () => {
+    const user = userEvent.setup();
+    const { onDock } = renderMain();
+    await user.click(screen.getByRole('button', { name: 'Dock to camera' }));
+    expect(onDock).toHaveBeenCalledTimes(1);
+  });
+
+  // A window operation, not a settings edit: nothing to wait for.
+  it('the dock button works before settings load', () => {
+    renderMain({}, { settings: null });
+    expect(screen.getByRole('button', { name: 'Dock to camera' })).toBeEnabled();
+  });
+
+  it('the focus toggle reports focusMode and calls onToggleFocus', async () => {
+    const user = userEvent.setup();
+    const { onToggleFocus } = renderMain();
+    const button = screen.getByRole('button', { name: 'Focus mode' });
+    expect(button).toHaveAttribute('aria-pressed', 'false');
+    await user.click(button);
+    expect(onToggleFocus).toHaveBeenCalledTimes(1);
+  });
+
+  it('Ctrl+Shift+F toggles focus mode from the window', async () => {
+    const user = userEvent.setup();
+    const { onToggleFocus } = renderMain();
+    await user.keyboard('{Control>}{Shift>}F{/Shift}{/Control}');
+    expect(onToggleFocus).toHaveBeenCalledTimes(1);
+  });
+
+  // Inside a text field the chord could be a legitimate edit.
+  it('Ctrl+Shift+F is ignored while typing in a text field', async () => {
+    const user = userEvent.setup();
+    const { onToggleFocus } = renderMain();
+    screen.getByLabelText('Type a question').focus();
+    await user.keyboard('{Control>}{Shift>}F{/Shift}{/Control}');
+    expect(onToggleFocus).not.toHaveBeenCalled();
+  });
+});
+
+describe('focus mode', () => {
+  it('hides the ask row, chips, banner and transcript but keeps Record, status and the answer', () => {
+    const { container } = renderMain(
+      {},
+      { settings: { ...twoProfiles, llmProvider: 'local' }, focusMode: true }
+    );
+    expect(container.querySelector('.main-view--focus')).not.toBeNull();
+    expect(screen.getByRole('button', { name: 'Focus mode' })).toHaveAttribute('aria-pressed', 'true');
+    // Out of the a11y tree (hidden attribute), still mounted.
+    expect(screen.queryByRole('textbox', { name: 'Type a question' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^Question heard/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('group', { name: 'Call profile' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('complementary', { name: 'Current mode' })).not.toBeInTheDocument();
+    expect(screen.queryByText(/^Tip: press/)).not.toBeVisible();
+    // Kept.
+    expect(screen.getByRole('button', { name: `Record ${HK_TEXT}` })).toBeVisible();
+    expect(screen.getByRole('group', { name: 'Answer style' })).toBeVisible();
+    expect(screen.getByText(/^Ready — press Record/)).toBeVisible();
+    expect(screen.getByText('Your AI-suggested answer will stream here.')).toBeVisible();
+  });
+
+  it('keeps the transcript element mounted so a toggle back needs no remount', () => {
+    const { container } = renderMain({}, { focusMode: true });
+    expect(container.querySelector('.transcript-panel')).toHaveAttribute('hidden');
   });
 });
 

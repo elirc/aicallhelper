@@ -24,6 +24,10 @@ pub enum ErrorCode {
     LlmTimeout,
     Aborted,
     Internal,
+    /// A full Settings form was seeded from an older settings revision than
+    /// the one now committed (R5, ADR 016). Distinct so the UI can keep the
+    /// draft and offer a reload instead of showing a generic failure.
+    SettingsConflict,
 }
 
 impl ErrorCode {
@@ -43,6 +47,7 @@ impl ErrorCode {
             ErrorCode::LlmTimeout => "llm_timeout",
             ErrorCode::Aborted => "aborted",
             ErrorCode::Internal => "internal",
+            ErrorCode::SettingsConflict => "settings_conflict",
         }
     }
 }
@@ -125,6 +130,7 @@ mod tests {
             (ErrorCode::LlmTimeout, "llm_timeout"),
             (ErrorCode::Aborted, "aborted"),
             (ErrorCode::Internal, "internal"),
+            (ErrorCode::SettingsConflict, "settings_conflict"),
         ];
         for (code, wire) in all {
             assert_eq!(code.as_str(), wire);

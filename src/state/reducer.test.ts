@@ -6,6 +6,10 @@
 import { describe, expect, it } from 'vitest';
 import { HISTORY_LIMIT, MAX_RECORDING_SECONDS, type AppError, type Metrics } from '../types';
 import {
+  CANCELLED_REASON,
+  LIMITED_REASON,
+  LOST_SESSION_ERROR,
+  SUPERSEDED_REASON,
   initialState,
   sessionReducer,
   type HistoryEntry,
@@ -19,7 +23,7 @@ const err = (code: AppError['code'], message = 'boom'): AppError => ({ code, mes
 const metrics: Metrics = { sttFinalizeMs: 480, firstTokenMs: 950, totalMs: 3210 };
 
 function entry(over: Partial<HistoryEntry> = {}): HistoryEntry {
-  return { key: 'k', sessionId: null, question: '', answer: '', metrics: null, ...over };
+  return { key: 'k', sessionId: null, question: '', answer: '', metrics: null, status: 'pending', reason: null, ...over };
 }
 
 function st(over: Partial<SessionState> = {}): SessionState {
@@ -284,7 +288,7 @@ describe('tick and the recording cap', () => {
     const capped = sessionReducer(recording({ elapsedMs: CAP_MS - 1 }), { type: 'tick', deltaMs: 250 });
     const done = sessionReducer(capped, {
       type: 'event/llmDone',
-      payload: { sessionId: 7, transcript: 't', answer: 'a', metrics },
+      payload: { sessionId: 7, transcript: 't', answer: 'a', metrics, stopReason: 'complete' },
     });
     expect(done.hitRecordingCap).toBe(true);
     const restarted = sessionReducer(done, { type: 'record/start', key: 'n2' });
@@ -313,13 +317,13 @@ describe('core auto-stop recovery (answer events while still "recording")', () =
   it('llm:done for the current session completes the entry straight from recording', () => {
     const next = sessionReducer(recording(), {
       type: 'event/llmDone',
-      payload: { sessionId: 7, transcript: 'capped q', answer: 'full a', metrics },
+      payload: { sessionId: 7, transcript: 'capped q', answer: 'full a', metrics, stopReason: 'complete' },
     });
     expect(next.ui).toBe('idle');
     expect(next.activeId).toBeNull();
     expect(next.liveKey).toBeNull();
     expect(next.history[0]).toEqual(
-      entry({ key: 'live', sessionId: 7, question: 'capped q', answer: 'full a', metrics }),
+      entry({ key: 'live', sessionId: 7, question: 'capped q', answer: 'full a', metrics, status: 'completed' }),
     );
     expect(next.error).toBeNull();
   });
@@ -328,7 +332,7 @@ describe('core auto-stop recovery (answer events while still "recording")', () =
     const prev = recording();
     expect(sessionReducer(prev, { type: 'event/llmDelta', payload: { sessionId: 999, delta: 'x' } })).toBe(prev);
     expect(
-      sessionReducer(prev, { type: 'event/llmDone', payload: { sessionId: 999, transcript: 't', answer: 'a', metrics } }),
+      sessionReducer(prev, { type: 'event/llmDone', payload: { sessionId: 999, transcript: 't', answer: 'a', metrics, stopReason: 'complete' } }),
     ).toBe(prev);
   });
 
@@ -336,12 +340,12 @@ describe('core auto-stop recovery (answer events while still "recording")', () =
     const starting = st({ ui: 'starting', liveKey: 'a', history: [entry({ key: 'a' })] });
     expect(sessionReducer(starting, { type: 'event/llmDelta', payload: { sessionId: 1, delta: 'x' } })).toBe(starting);
     expect(
-      sessionReducer(starting, { type: 'event/llmDone', payload: { sessionId: 1, transcript: 't', answer: 'a', metrics } }),
+      sessionReducer(starting, { type: 'event/llmDone', payload: { sessionId: 1, transcript: 't', answer: 'a', metrics, stopReason: 'complete' } }),
     ).toBe(starting);
     const pendingAsk = sessionReducer(st(), { type: 'ask/start', key: 'a', question: 'q' });
     expect(sessionReducer(pendingAsk, { type: 'event/llmDelta', payload: { sessionId: 1, delta: 'x' } })).toBe(pendingAsk);
     expect(
-      sessionReducer(pendingAsk, { type: 'event/llmDone', payload: { sessionId: 1, transcript: 't', answer: 'a', metrics } }),
+      sessionReducer(pendingAsk, { type: 'event/llmDone', payload: { sessionId: 1, transcript: 't', answer: 'a', metrics, stopReason: 'complete' } }),
     ).toBe(pendingAsk);
   });
 });
@@ -356,7 +360,7 @@ describe('stale events change nothing, ever', () => {
     const answering = recording({ ui: 'answering' });
     expect(sessionReducer(answering, { type: 'event/llmDelta', payload: { sessionId: wrong, delta: 'x' } })).toBe(answering);
     expect(
-      sessionReducer(answering, { type: 'event/llmDone', payload: { sessionId: wrong, transcript: 't', answer: 'a', metrics } }),
+      sessionReducer(answering, { type: 'event/llmDone', payload: { sessionId: wrong, transcript: 't', answer: 'a', metrics, stopReason: 'complete' } }),
     ).toBe(answering);
   });
 
@@ -403,13 +407,13 @@ describe('event application', () => {
     );
     const next = sessionReducer(answering, {
       type: 'event/llmDone',
-      payload: { sessionId: 7, transcript: 'the question', answer: 'Use refs.', metrics },
+      payload: { sessionId: 7, transcript: 'the question', answer: 'Use refs.', metrics, stopReason: 'complete' },
     });
     expect(next.ui).toBe('idle');
     expect(next.activeId).toBeNull();
     expect(next.liveKey).toBeNull();
     expect(next.history[0]).toEqual(
-      entry({ key: 'live', sessionId: 7, question: 'the question', answer: 'Use refs.', metrics }),
+      entry({ key: 'live', sessionId: 7, question: 'the question', answer: 'Use refs.', metrics, status: 'completed' }),
     );
   });
 
@@ -489,7 +493,7 @@ describe('history limit', () => {
       s = sessionReducer(s, { type: 'ask/accepted', key: `k${i}`, id: i });
       s = sessionReducer(s, {
         type: 'event/llmDone',
-        payload: { sessionId: i, transcript: `q${i}`, answer: `a${i}`, metrics },
+        payload: { sessionId: i, transcript: `q${i}`, answer: `a${i}`, metrics, stopReason: 'complete' },
       });
       expect(s.history.length).toBeLessThanOrEqual(HISTORY_LIMIT);
       expect(s.history[s.history.length - 1]?.question).toBe(`q${i}`);
@@ -532,5 +536,132 @@ describe('error/set', () => {
     const withErr = sessionReducer(st(), { type: 'error/set', error: err('llm_rate_limit') });
     expect(withErr.error).toEqual(err('llm_rate_limit'));
     expect(sessionReducer(withErr, { type: 'error/set', error: null }).error).toBeNull();
+  });
+});
+
+describe('entry status (R2)', () => {
+  it('a token-capped done is kept as "limited" with its reason; a normal done is "completed"', () => {
+    const limited = sessionReducer(recording(), {
+      type: 'event/llmDone',
+      payload: { sessionId: 7, transcript: 'q', answer: 'long', metrics, stopReason: 'token_limit' },
+    });
+    expect(limited.history[0]).toMatchObject({ status: 'limited', reason: LIMITED_REASON, answer: 'long' });
+    expect(limited.error).toBeNull();
+    const done = sessionReducer(recording(), {
+      type: 'event/llmDone',
+      payload: { sessionId: 7, transcript: 'q', answer: 'a', metrics, stopReason: 'complete' },
+    });
+    expect(done.history[0]).toMatchObject({ status: 'completed', reason: null });
+  });
+
+  it('an interrupted answer stays marked incomplete after the next question clears the error', () => {
+    // The whole point of per-entry status: the global error is gone the
+    // moment the user asks again, but the half answer must still read as
+    // half an answer when they page back to it.
+    const failed = reduce(
+      recording(),
+      { type: 'record/stop' },
+      { type: 'event/llmDelta', payload: { sessionId: 7, delta: 'Half' } },
+      { type: 'event/sessionError', payload: { sessionId: 7, error: err('llm_http', 'ended early') } },
+    );
+    expect(failed.history[0]).toMatchObject({ answer: 'Half', status: 'incomplete', reason: 'ended early' });
+    const next = sessionReducer(failed, { type: 'ask/start', key: 'n', question: 'again?' });
+    expect(next.error).toBeNull();
+    expect(next.history[0]).toMatchObject({ status: 'incomplete', reason: 'ended early' });
+    expect(next.history[1]).toMatchObject({ status: 'pending', reason: null });
+  });
+
+  it('a superseded or aborted entry is marked cancelled, never incomplete', () => {
+    const streaming = reduce(
+      recording(),
+      { type: 'record/stop' },
+      { type: 'event/llmDelta', payload: { sessionId: 7, delta: 'Part' } },
+    );
+    const superseded = sessionReducer(streaming, { type: 'record/start', key: 'n' });
+    expect(superseded.history[0]).toMatchObject({ status: 'cancelled', reason: SUPERSEDED_REASON });
+    const aborted = sessionReducer(streaming, {
+      type: 'event/sessionError',
+      payload: { sessionId: 7, error: err('aborted') },
+    });
+    expect(aborted.history[0]).toMatchObject({ status: 'cancelled', reason: CANCELLED_REASON });
+    expect(aborted.error).toBeNull();
+  });
+});
+
+describe('session/outcome reconciliation (R1)', () => {
+  const lookup = (outcome: Extract<SessionAction, { type: 'session/outcome' }>['outcome'], key = 'live', id = 7) =>
+    ({ type: 'session/outcome', key, id, outcome }) as SessionAction;
+
+  it('a completed outcome settles the adopted attempt exactly like llm:done', () => {
+    const next = sessionReducer(
+      recording(),
+      lookup({ status: 'completed', transcript: 'q', answer: 'Early answer.', metrics, stopReason: 'complete' }),
+    );
+    expect(next.ui).toBe('idle');
+    expect(next.activeId).toBeNull();
+    expect(next.history[0]).toMatchObject({ question: 'q', answer: 'Early answer.', metrics, status: 'completed' });
+  });
+
+  it('a failed outcome keeps the longer text, surfaces the error, marks the entry incomplete', () => {
+    const partial = reduce(
+      recording({ ui: 'answering' }),
+      { type: 'event/llmDelta', payload: { sessionId: 7, delta: 'Half' } },
+    );
+    const next = sessionReducer(
+      partial,
+      lookup({ status: 'failed', error: err('llm_http', 'cut'), transcript: 'the q', partial: 'Half an answer' }),
+    );
+    expect(next.ui).toBe('idle');
+    expect(next.error).toEqual(err('llm_http', 'cut'));
+    expect(next.history[0]).toMatchObject({
+      question: 'the q',
+      answer: 'Half an answer',
+      status: 'incomplete',
+      reason: 'cut',
+    });
+  });
+
+  it('cancelled settles silently; unknown settles with the lost-session error instead of hanging', () => {
+    const cancelled = sessionReducer(recording(), lookup({ status: 'cancelled' }));
+    expect(cancelled.ui).toBe('idle');
+    expect(cancelled.error).toBeNull();
+    const unknown = sessionReducer(recording(), lookup({ status: 'unknown' }));
+    expect(unknown.ui).toBe('idle');
+    expect(unknown.error).toEqual(LOST_SESSION_ERROR);
+  });
+
+  it('never settles another attempt or another id, and active changes nothing (identity)', () => {
+    const live = recording();
+    const done = { status: 'completed', transcript: 'q', answer: 'a', metrics, stopReason: 'complete' } as const;
+    expect(sessionReducer(live, lookup(done, 'older-attempt'))).toBe(live);
+    expect(sessionReducer(live, lookup(done, 'live', 6))).toBe(live);
+    expect(sessionReducer(live, lookup({ status: 'active' }))).toBe(live);
+  });
+
+  it('is idempotent with the live terminal event: the second delivery is ignored', () => {
+    const done = sessionReducer(recording(), {
+      type: 'event/llmDone',
+      payload: { sessionId: 7, transcript: 'q', answer: 'a', metrics, stopReason: 'complete' },
+    });
+    const again = sessionReducer(
+      done,
+      lookup({ status: 'failed', error: err('internal'), transcript: 'q', partial: '' }),
+    );
+    expect(again).toBe(done);
+    expect(sessionReducer(done, { type: 'event/llmDone', payload: { sessionId: 7, transcript: 'q', answer: 'a', metrics, stopReason: 'complete' } })).toBe(done);
+  });
+
+  it('a failed outcome replaces a mid-text fragment with the full partial', () => {
+    // Review F4: an entry that lost its first held deltas shows a fragment
+    // from the middle of the text; the core's partial contains it and wins.
+    const fragment = reduce(
+      recording({ ui: 'answering' }),
+      { type: 'event/llmDelta', payload: { sessionId: 7, delta: 'middle' } },
+    );
+    const next = sessionReducer(
+      fragment,
+      lookup({ status: 'failed', error: err('llm_http', 'cut'), transcript: 'q', partial: 'The middle part' }),
+    );
+    expect(next.history[0]).toMatchObject({ answer: 'The middle part', status: 'incomplete' });
   });
 });

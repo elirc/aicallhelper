@@ -16,6 +16,7 @@ const RENDERED_CODES: ErrorCode[] = [
   'llm_first_token_timeout',
   'llm_timeout',
   'internal',
+  'settings_conflict',
 ];
 
 describe('ErrorBox', () => {

@@ -1,14 +1,19 @@
 import type { UiState } from '../state/useSession';
 import { formatHotkey } from '../format';
-import type { HotkeyStatus } from './hotkey';
+import type { HotkeyStatus } from '../types';
 
 interface StatusLineProps {
   state: UiState;
   hitRecordingCap: boolean;
   /** The last session finished cleanly and nothing new has started. */
   justCompleted: boolean;
-  /** A key needed by the selected provider (or Deepgram) is missing. */
-  firstRun: boolean;
+  /**
+   * A key needed by the selected provider (or Deepgram) is missing. null
+   * while settings have not loaded: the line then renders EMPTY rather than
+   * guessing — a "Ready" that flips to "First run" a frame later (or the
+   * reverse) is a wrong first frame the user notices.
+   */
+  firstRun: boolean | null;
   hotkey: HotkeyStatus | null;
 }
 
@@ -18,7 +23,11 @@ interface StatusLineProps {
  */
 export function StatusLine({ state, hitRecordingCap, justCompleted, firstRun, hotkey }: StatusLineProps) {
   let text: string;
-  if (hitRecordingCap && (state === 'recording' || state === 'finalizing' || state === 'answering')) {
+  if (firstRun === null) {
+    // Permanently mounted with empty text (the min-height keeps the row);
+    // the live region must pre-exist the first real message to be announced.
+    text = '';
+  } else if (hitRecordingCap && (state === 'recording' || state === 'finalizing' || state === 'answering')) {
     // The stop the user never pressed: without this line the app appears to
     // stop itself for no reason at exactly 2 minutes.
     text = 'Reached the 120s limit — answering now';

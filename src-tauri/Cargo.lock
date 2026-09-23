@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "aicallhelper"
-version = "3.0.0"
+version = "3.1.0"
 dependencies = [
  "app-core",
  "serde",
@@ -86,7 +86,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "app-core"
-version = "3.0.0"
+version = "3.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

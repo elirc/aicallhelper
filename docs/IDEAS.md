@@ -8,8 +8,13 @@ using instead of a browser tab:
 2. **The single-session invariant** (SPEC §5). Every new state or stream
    multiplies the race matrix that took a full v2 of bugs to pin down.
 3. **The privacy posture** (SPEC §1, §11). One user, their keys, three known
-   origins (Deepgram, Anthropic, Groq), nothing sensitive on disk or in logs,
-   invisible to screen share.
+   cloud origins (Deepgram, Anthropic, Groq) — or, only while Free local
+   voice is selected, two loopback origins on the same machine
+   (`127.0.0.1:11434` Ollama, `127.0.0.1:8765` Moonshine) carrying no key
+   material — nothing sensitive on disk beyond the plaintext profiles, nothing
+   in logs, and a window whose Windows capture exclusion is verified at
+   launch (whether a conferencing app honours it is only known from recorded
+   tests).
 
 Every idea names the modules it touches, its spec-level risks, an effort guess
 (**S** = an afternoon, **M** = a few sessions, **L** = a project), and the trap
@@ -24,7 +29,7 @@ product. Traps are listed because the trap is always the *obvious* version.
 |---|------|---------|
 | 1 | [Post-interview debrief export](#2-post-interview-debrief-export--m) | Highest value per unit of risk in the list. The interview's value doesn't end when the call does, and this is frontend-plus-one-save-dialog — it touches zero hot-path invariants. |
 | 2 | [Per-question style modifiers](#1-per-question-answer-style-via-modifier-keys--s) | The cache split (§7) makes it latency-free *by construction* — the rare feature the architecture was pre-built for. Smallest effort on the list. |
-| 3 | [Latency telemetry panel](#3-latency-telemetry-panel-local-only--s) | The product is judged on one number; start keeping score. Also the evidence base for later decisions — provider fallback (#8) and local STT (#9) are guesses until this exists. |
+| 3 | [Latency telemetry panel](#3-latency-telemetry-panel-local-only--s) | The product is judged on one number; start keeping score. Also the evidence base for later decisions — provider fallback (#8) and the free local mode's real numbers (#9) are guesses until this exists. |
 
 The pattern is deliberate: none of the three touch `machine.rs`, the audio
 path, or the stop-to-first-word window. Bank the cheap wins before spending
@@ -46,7 +51,7 @@ default (same modifiers on the Ask submit). `stop_session`/`ask`
 only the `style_suffix` when the machine fills in the `AnswerRequest`. The
 suffix already lives *after* the cache breakpoint
 (`src-tauri/core/src/llm/prompt.rs:63-72`), so an override can never
-invalidate the cached resume+JD — this is the exact scenario the §7 split was
+invalidate the cached profile — this is the exact scenario the §7 split was
 designed for. The persisted setting is untouched.
 
 **Risks**: §9 pins the style chips' `aria-pressed` to the *persisted* style —
@@ -233,27 +238,32 @@ new costume.
 mid-interview the user must know. And never retry-then-fallback (three
 attempts) — the budget math stops working.
 
-### 9. Local STT fallback (whisper.cpp) — L
+### 9. Local STT (and answers) — shipped as Free local voice; whisper.cpp remains an option — L
 
-**Problem**: no network, or cost — Deepgram's per-minute streaming dominates
-spend (README cost note); recording minutes, not questions, are what you pay
-for.
+**Status**: the mode exists. **Free local voice** pairs Moonshine Tiny
+Streaming (English speech over a loopback WebSocket, `core/src/stt/local.rs`)
+with Ollama + Qwen3.5 2B for answers (`core/src/llm/local.rs`), selected as
+a provider in Settings, with no keys at all
+([FREE_VOICE_MODE.md](FREE_VOICE_MODE.md)). It was built exactly the way
+this entry asked: through the trait seams, so `machine.rs` and every §5
+invariant test apply unchanged; as a *mode the user picks*, labelled with
+its real ceilings (90 s first token / 300 s total, §3); never a silent
+fallback. The choice of speech path is a capability of the provider
+(`uses_deepgram()`), not a separate `stt` setting.
 
-**Sketch**: the trait seam makes this honest to attempt: implement
-`SttConnector`/`SttStream` (`src-tauri/core/src/stt/mod.rs:25-46`) over
-whisper.cpp streaming; `SessionDeps` takes any connector
-(`src-tauri/core/src/session/mod.rs:108-115`), so `machine.rs` and every §5
-invariant test apply unchanged. Settings grow `stt: "deepgram" | "local"`.
+**What is left of the idea**: whisper.cpp as an alternative speech engine
+(a `base.en` model handles accents Moonshine Tiny does not; the
+[model survey](LOCAL_MODELS_REPORT.md) already compared them), and a larger
+local answer model for machines with the RAM. Both slot into the existing
+seams: another `SttConnector` behind the same `LocalConnector` contract,
+another model constant behind `LocalProvider`.
 
-**Risks**: the latency promise is the hard part. CPU whisper finalize can
-blow the 5 s finalize cap (§3) and the ~1 s promise with it — expect 2–4 s
-stop-to-first-word on typical hardware and report the honest number (the
-metrics pipeline already refuses to flatter, §3). Model weights (~140 MB) and
-a native build in a crate whose only platform dependency today is WASAPI.
+**Risks**: unchanged — the latency promise. CPU inference cannot make the
+~1 s number; the metrics pipeline reports the honest one (§3). The 7 KB
+prompt cap is per active profile, focus and extra instructions included.
 
 **Don't build**: automatic fallback mid-session, or making local the silent
-default. This is a *mode the user picks*, labelled with its real latency —
-"offline/cheap", not "the same but free".
+default. Still "offline/cheap", never "the same but free".
 
 ### 10. Coaching mode: post-answer critique — L (depends on #6)
 
@@ -299,14 +309,20 @@ already exists; this is one more lever on it, not a new system.
 
 **Problem**: laptop ↔ dock changes the monitor set; the 40 px rule rightly
 drops the now-offscreen position (§8, `src-tauri/core/src/store/bounds.rs`)
-and the window recenters — so you re-place it on every dock/undock cycle.
+and the window re-docks to the camera — so with "Remember where I left it"
+you re-place it on every dock/undock cycle. (With the default "Dock under
+the camera" launch placement, ADR 013, this problem mostly dissolves: the
+window goes to the top-centre of whatever display it is on, every launch.
+What is left is the user who wants a *remembered* spot per arrangement.)
 
 **Sketch**: key saved bounds by a display-set fingerprint — the shell already
 enumerates monitors and their work areas for sanitizing
-(`src-tauri/src/window.rs:43-52`); hash the sorted rect list. `windowBounds`
-becomes a small map `{fingerprint → bounds}` capped at ~4 arrangements. The
-sanitizer applies unchanged *per entry*, and a corrupt entry drops as a unit
-while the rest of the file survives — the existing §8 discipline, widened.
+(`src-tauri/src/window.rs`, `current_work_areas`); hash the sorted rect list.
+`windowBounds` becomes a small map `{fingerprint → bounds}` capped at ~4
+arrangements. The sanitizer applies unchanged *per entry*, and a corrupt
+entry drops as a unit while the rest of the file survives — the existing §8
+discipline, widened. The map must key the *placement* too: a docked laptop
+arrangement must not restore a remembered desktop position.
 
 **Risks**: settings migration (scalar → map) must fall back per-field, never
 nuke the file (§8). The bounds geometry cases are pinned by tests — extend
@@ -410,15 +426,44 @@ bad transcript. The 1 s promise is the product; this feature fixes mistakes
 Things that would betray the product, no matter how nicely they demo:
 
 - **Cloud accounts, hosted relays, "our" server.** The pitch is single user,
-  own keys, three known origins (§1). A server component converts a privacy
-  tool into a trust decision, and there is no feature above that needs one.
+  own keys, three known cloud origins — or two loopback ones in free local
+  mode (§1). A server component converts a privacy tool into a trust
+  decision, and there is no feature above that needs one.
 - **Telemetry, ever.** §11's "log nothing sensitive" extends to "phone home
   never". The latency panel (#3) is the model: measure everything, keep it on
   the machine.
 - **Generic chatbot drift.** No conversation UI, no personas, no "chat with
   your resume". Every feature must serve the ~8 seconds between Stop and
   speaking; anything that doesn't is a different product wearing this one's
-  window.
+  window. **Call profiles are not personas** (ADR 014): a profile is
+  grounding *data* chosen per call — the user's own resume, the job or
+  account, what to emphasise, their own extra instructions — and the role
+  instructions never change. The call type is a closed enum with one pinned
+  sentence per variant; there is no free-text "who the AI is". A feature
+  that lets the app speak as someone other than the user is the drift this
+  bullet exists to stop.
+
+**Decided with v3.1 — don't build** (the reasoning is in the design
+studies and ADR 013/014; listed here so it does not get re-proposed):
+
+- *Auto-detecting the call type or profile from the transcript.* A wrong
+  guess silently grounds the answer in the wrong JD — the exact
+  "confidently wrong in one second" failure profiles exist to prevent — and
+  it does work inside the stop-to-first-word window. Selecting a profile is
+  a deliberate gesture, like Stop.
+- *Per-question profile switching* (or modifier-key profile overrides). The
+  cache split exists for per-question *style* (#1); a profile is per-call by
+  definition, and a per-question prefix change is a cache write on every
+  question with a large profile (ADR 007).
+- *Per-profile default answer style.* A second source of truth for the
+  chips' `aria-pressed` contract (§9). Revisit only if users report flipping
+  the style after every switch — and then write through the same persisted
+  field.
+- *Free-text call types.* Unpinnable prompt text headed for the system
+  block.
+- *Auto-docking mid-call, a second global hotkey for docking, a frameless
+  title bar.* A window that jumps mid-call is worse than a stable one;
+  `hotkey.rs` owns exactly one shortcut; native decorations stay (§9).
 - **The app never speaks for you.** No TTS autopilot, no auto-submitted
   answers anywhere. The human says the words — the tool's job ends at the
   suggestion.

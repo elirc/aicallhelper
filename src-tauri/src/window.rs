@@ -7,10 +7,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tauri::{
-    AppHandle, Manager, PhysicalPosition, PhysicalSize, Url, WebviewWindow, Window, WindowEvent,
+    AppHandle, Manager, Monitor, PhysicalPosition, PhysicalSize, Url, WebviewWindow, Window,
+    WindowEvent,
 };
 
-use app_core::store::{sanitize_bounds, RawBounds, WorkArea};
+use app_core::store::{dock_preset_size, dock_top_center, sanitize_bounds, RawBounds, WorkArea};
+use app_core::AppError;
 
 use crate::state::{lock, AppState};
 
@@ -19,47 +21,176 @@ pub const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 pub const RELOAD_MIN_GAP: Duration = Duration::from_secs(10);
 
 // ---------------------------------------------------------------------------
+// Capture exclusion (verified, not just requested)
+// ---------------------------------------------------------------------------
+
+/// `WDA_EXCLUDEFROMCAPTURE`: Windows leaves the window out of screen captures
+/// made through its public capture APIs. Supported from Windows 10 version
+/// 2004; older builds reject it.
+pub const WDA_EXCLUDEFROMCAPTURE: u32 = 0x11;
+
+/// Why launch is refused when the exclusion did not take. Names the Windows
+/// requirement because that is the one cause a user can act on.
+pub const MSG_CAPTURE_EXCLUSION_REFUSED: &str = "Windows did not apply screen-capture exclusion to the window, so the app will not start. This needs Windows 10 version 2004 or later.";
+
+/// Map what `GetWindowDisplayAffinity` read back (`None` = the read itself
+/// failed) to a launch verdict. Pure so the mapping is unit-tested; the real
+/// window cannot be created under `cargo test`.
+///
+/// Only `WDA_EXCLUDEFROMCAPTURE` passes. `WDA_NONE` (0x00) means the request
+/// was dropped, and `WDA_MONITOR` (0x01) is the pre-2004 fallback that shows
+/// a black rectangle rather than excluding the window — neither is the
+/// promise the app makes.
+pub fn capture_exclusion_verdict(read_back: Option<u32>) -> Result<(), String> {
+    match read_back {
+        Some(WDA_EXCLUDEFROMCAPTURE) => Ok(()),
+        Some(other) => Err(format!("{MSG_CAPTURE_EXCLUSION_REFUSED} (display affinity read back as 0x{other:02x})")),
+        None => Err(format!("{MSG_CAPTURE_EXCLUSION_REFUSED} (the display affinity could not be read back)")),
+    }
+}
+
+/// Read the window's display affinity back from Windows and require
+/// `WDA_EXCLUDEFROMCAPTURE`.
+///
+/// Needed because `set_content_protected` cannot report a refusal: tao 0.35
+/// discards the result of `SetWindowDisplayAffinity`, and the runtime only
+/// reports a failure to send the request. Declared directly against user32
+/// rather than pulling a `windows` crate version into the shell.
+#[cfg(windows)]
+pub fn verify_capture_exclusion(win: &WebviewWindow) -> Result<(), String> {
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetWindowDisplayAffinity(hwnd: *mut std::ffi::c_void, affinity: *mut u32) -> i32;
+    }
+    let hwnd = win
+        .hwnd()
+        .map_err(|e| format!("{MSG_CAPTURE_EXCLUSION_REFUSED} (no native window handle: {e})"))?;
+    let mut affinity: u32 = 0;
+    // SAFETY: `hwnd` is the live main window owned by this process, and
+    // `affinity` is a valid out-pointer for the duration of the call.
+    let ok = unsafe { GetWindowDisplayAffinity(hwnd.0, &mut affinity) };
+    capture_exclusion_verdict((ok != 0).then_some(affinity))
+}
+
+/// Non-Windows builds exist only for tooling; there is nothing to verify.
+#[cfg(not(windows))]
+pub fn verify_capture_exclusion(_win: &WebviewWindow) -> Result<(), String> {
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Geometry restore
 // ---------------------------------------------------------------------------
 
 /// Apply saved geometry through `sanitize_bounds` against the monitors that
-/// exist right now. The size is always applied; the position only when the
-/// sanitizer could prove it lands on a live display — otherwise centre, which
-/// is the only spot guaranteed reachable.
+/// exist right now.
+///
+/// The size is applied only when it came from the settings file: those are
+/// PHYSICAL pixels, saved by `current_bounds`, and round-trip exactly. The
+/// first-run fallback is the builder's LOGICAL 460x700, which tao has already
+/// scaled by DPI; re-applying it through `set_size(PhysicalSize)` shrank the
+/// window by the scale factor on every 125-150 % laptop and then persisted
+/// that smaller size as the user's "choice" (RS-7).
+///
+/// The position is applied only when the sanitizer could prove it lands on a
+/// live display. Otherwise the window docks to the camera (§9: top-centre of
+/// the current display, the spot the answer is designed to be read from) and
+/// centres only if docking itself fails — centre is the one spot guaranteed
+/// reachable when even the monitor list cannot be trusted.
 pub fn restore_geometry(window: &WebviewWindow, saved: Option<RawBounds>) {
     let displays = current_work_areas(window);
     let sanitized = sanitize_bounds(saved, &displays);
-    let _ = window.set_size(PhysicalSize::new(sanitized.width, sanitized.height));
+    if sanitized.from_saved {
+        let _ = window.set_size(PhysicalSize::new(sanitized.width, sanitized.height));
+    }
     match sanitized.position {
         Some((x, y)) => {
             let _ = window.set_position(PhysicalPosition::new(x, y));
         }
         None => {
-            let _ = window.center();
+            if dock_to_camera(window, DockSize::Keep).is_err() {
+                let _ = window.center();
+            }
         }
+    }
+}
+
+fn work_area_of(m: &Monitor) -> WorkArea {
+    // `work_area` already excludes the taskbar, in physical pixels — the
+    // units every pure geometry function in the core speaks.
+    let area = m.work_area();
+    WorkArea {
+        x: area.position.x,
+        y: area.position.y,
+        width: area.size.width,
+        height: area.size.height,
     }
 }
 
 fn current_work_areas(window: &WebviewWindow) -> Vec<WorkArea> {
     // Enumeration failure yields an empty list, which sanitize_bounds treats as
-    // "cannot prove anything, centre it" — exactly the safe answer.
+    // "cannot prove anything, let the shell place it" — exactly the safe
+    // answer.
     window
         .available_monitors()
-        .map(|monitors| {
-            monitors
-                .iter()
-                .map(|m| {
-                    let area = m.work_area();
-                    WorkArea {
-                        x: area.position.x,
-                        y: area.position.y,
-                        width: area.size.width,
-                        height: area.size.height,
-                    }
-                })
-                .collect()
-        })
+        .map(|monitors| monitors.iter().map(work_area_of).collect())
         .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Dock to camera (§9)
+// ---------------------------------------------------------------------------
+
+/// Which size a dock applies: the wide reading preset (the header button) or
+/// the size the window already has (launch with `launchPlacement: camera`,
+/// and the restore fallback — the saved size is the user's; only the position
+/// is overridden).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockSize {
+    Preset,
+    Keep,
+}
+
+fn os_err(e: tauri::Error) -> AppError {
+    AppError::internal(format!("Could not move the window: {e}"))
+}
+
+/// Move the window to the top-centre of the display it is on (the primary
+/// when that cannot be determined) — directly under a webcam, so reading the
+/// answer reads as eye contact. The Moved/Resized events this raises go
+/// through the normal debounced bounds save, so the docked geometry persists
+/// exactly like a drag would. All math is in the core (`dock_top_center`,
+/// `dock_preset_size`); this adapter only measures and applies.
+pub fn dock_to_camera(window: &WebviewWindow, size: DockSize) -> Result<(), AppError> {
+    let monitor = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| window.primary_monitor().ok().flatten())
+        .ok_or_else(|| AppError::internal("Could not find the display this window is on."))?;
+    let work = work_area_of(&monitor);
+
+    let inner = window.inner_size().map_err(os_err)?;
+    let outer = window.outer_size().map_err(os_err)?;
+    // Measured BEFORE any resize: the decoration width is a property of the
+    // window style, not of its current size, and reading outer_size straight
+    // after a dispatched set_size would race the event loop when the caller
+    // is not on the main thread (the async settings hop).
+    let frame_w = outer.width.saturating_sub(inner.width);
+
+    let (inner_w, inner_h) = match size {
+        DockSize::Preset => dock_preset_size(work, monitor.scale_factor()),
+        DockSize::Keep => (inner.width, inner.height),
+    };
+    if size == DockSize::Preset {
+        window.set_size(PhysicalSize::new(inner_w, inner_h)).map_err(os_err)?;
+    }
+    // Windows' invisible resize borders sit inside GetWindowRect symmetrically,
+    // so centring the OUTER rect centres the visible frame; the top border is
+    // ~1 px, so the visible top lands DOCK_TOP_MARGIN below the work-area edge
+    // (and below a top-docked taskbar, which `work.y` already excludes).
+    let (x, y) = dock_top_center(work, inner_w + frame_w);
+    window.set_position(PhysicalPosition::new(x, y)).map_err(os_err)
 }
 
 fn current_bounds(window: &Window) -> Option<RawBounds> {
@@ -324,6 +455,19 @@ pub fn install_crash_recovery(_win: &WebviewWindow) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_exclude_from_capture_counts_as_verified() {
+        // The launch promise is "excluded from capture", checked against
+        // what Windows actually applied. WDA_MONITOR is the pre-2004
+        // black-rectangle mode — not the promise — and a failed read proves
+        // nothing, so both refuse, with the Windows requirement named.
+        assert_eq!(capture_exclusion_verdict(Some(0x11)), Ok(()));
+        for refused in [Some(0x00), Some(0x01), None] {
+            let err = capture_exclusion_verdict(refused).unwrap_err();
+            assert!(err.contains("Windows 10 version 2004"), "{err}");
+        }
+    }
 
     fn bounds(x: f64) -> RawBounds {
         RawBounds { x, y: 0.0, width: 460.0, height: 700.0 }

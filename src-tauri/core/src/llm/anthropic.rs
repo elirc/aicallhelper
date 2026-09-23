@@ -9,6 +9,11 @@
 //! * **The returned answer is the byte-for-byte concatenation of the deltas.**
 //!   The UI renders the deltas live and then the returned string; any
 //!   divergence shows up to the user as text changing after they have read it.
+//! * **Only `message_stop` finishes an answer (R2).** The `stop_reason` in
+//!   `message_delta` is metadata about WHY the model stopped; it does not prove
+//!   the final protocol event arrived. A clean end of stream before
+//!   `message_stop` is an incomplete answer, and nothing after `message_stop`
+//!   is read.
 
 use std::sync::{Arc, Mutex};
 
@@ -19,9 +24,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{no_llm_key_message, AppError, AppResult, ErrorCode};
 use crate::llm::{
-    http, retry, warm, AnswerRequest, LlmProvider, LlmProviderKind, LlmSink, SseDecoder, SseEvent,
-    MAX_ANSWER_TOKENS,
+    ended_early, http, malformed_frame, oversized_frame, retry, warm, Answer, AnswerRequest,
+    LlmProvider, LlmProviderKind, LlmSink, SseDecoder, SseEvent, StopReason, MAX_ANSWER_TOKENS,
 };
+
+/// Used in the R2 outcome messages ("Anthropic stopped sending …").
+const LABEL: &str = "Anthropic";
 
 /// Pinned in exactly one place. Haiku because time-to-first-word is the
 /// product; a bigger model buys quality this use case cannot spend.
@@ -118,7 +126,7 @@ impl AnthropicProvider {
         sink: &Arc<dyn LlmSink>,
         cancel: &CancellationToken,
         delivered: &retry::Attempt,
-    ) -> AppResult<String> {
+    ) -> AppResult<Answer> {
         let request = http::shared_client()
             .post(format!("{}/v1/messages", self.base_url))
             .header("x-api-key", &self.api_key)
@@ -141,23 +149,23 @@ impl AnthropicProvider {
         if !(200..300).contains(&status) {
             // The body read is raced against cancel like every other await: a
             // user who pressed stop must not wait on a slow error body just to
-            // have the result thrown away.
+            // have the result thrown away. It is also capped while reading
+            // (R2): an error page is never held whole.
             let body_text = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(AppError::aborted()),
-                text = response.text() => text.unwrap_or_default(),
+                text = http::read_error_body(response) => text,
             };
             return Err(map_status(status, &body_text));
         }
 
         let mut decoder = SseDecoder::new();
-        let mut answer = String::new();
-        let mut saw_event = false;
+        let mut progress = StreamProgress::default();
         // Box::pin because reqwest only promises `impl Stream`; pinning here
         // keeps `next()` usable without caring whether that type is Unpin.
         let mut stream = Box::pin(response.bytes_stream());
 
-        loop {
+        'read: loop {
             let next = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(AppError::aborted()),
@@ -173,28 +181,43 @@ impl AnthropicProvider {
                     return Err(AppError::new(ErrorCode::LlmHttp, MSG_STREAM_DROPPED));
                 }
             };
-            for event in decoder.feed(&chunk) {
-                saw_event = true;
-                self.apply_event(&event, sink, delivered, &mut answer)?;
+            // On overflow, the events framed before the oversized line are
+            // still applied (so the kept partial text does not depend on
+            // chunking), and the stream fails right after them.
+            let (events, overflowed) = match decoder.feed(&chunk) {
+                Ok(events) => (events, false),
+                Err(overflow) => (overflow.decoded, true),
+            };
+            for event in events {
+                self.apply_event(&event, sink, delivered, &mut progress)?;
+                if progress.finished {
+                    // `message_stop` is the last protocol event: nothing after
+                    // it may become answer text, in this chunk or a later one.
+                    break 'read;
+                }
+            }
+            if overflowed {
+                return Err(oversized_frame(LABEL));
             }
         }
-        // A stream can end without a trailing newline; the flushed remainder
-        // still carries real events (see sse.rs).
-        for event in decoder.finish() {
-            saw_event = true;
-            self.apply_event(&event, sink, delivered, &mut answer)?;
+        if !progress.finished {
+            // A stream can end without a trailing newline; the flushed
+            // remainder still carries real events (see sse.rs).
+            let (events, overflowed) = match decoder.finish() {
+                Ok(events) => (events, false),
+                Err(overflow) => (overflow.decoded, true),
+            };
+            for event in events {
+                self.apply_event(&event, sink, delivered, &mut progress)?;
+                if progress.finished {
+                    break;
+                }
+            }
+            if overflowed && !progress.finished {
+                return Err(oversized_frame(LABEL));
+            }
         }
-
-        if !saw_event {
-            // A 200 with no SSE events is a broken response, not an empty
-            // answer — returning Ok("") here would render as the model
-            // silently saying nothing.
-            return Err(AppError::new(
-                ErrorCode::LlmHttp,
-                "Anthropic returned an empty response. Try again.",
-            ));
-        }
-        Ok(answer)
+        progress.conclude()
     }
 
     /// Interpret one SSE event. Only `content_block_delta` / `text_delta`
@@ -206,27 +229,34 @@ impl AnthropicProvider {
         event: &SseEvent,
         sink: &Arc<dyn LlmSink>,
         delivered: &retry::Attempt,
-        answer: &mut String,
+        progress: &mut StreamProgress,
     ) -> AppResult<()> {
+        progress.saw_event = true;
         let Ok(value) = serde_json::from_str::<Value>(&event.data) else {
-            // A single mangled event must not cost the whole answer.
-            return Ok(());
+            // Every Anthropic event is a JSON object. One that does not parse
+            // may have carried answer text; skipping it and later reporting a
+            // finished answer is the silent truncation R2 exists to prevent.
+            return Err(malformed_frame(LABEL));
         };
         match value["type"].as_str() {
             Some("content_block_delta") => {
                 if value["delta"]["type"].as_str() == Some("text_delta") {
-                    if let Some(text) = value["delta"]["text"].as_str() {
-                        if text.is_empty() {
-                            // Forwarding an empty delta wakes the UI for
-                            // nothing and cannot change the returned answer.
-                            return Ok(());
-                        }
-                        delivered.mark_delta_emitted();
-                        answer.push_str(text);
-                        // Pushed the moment it is decoded — never batched.
-                        sink.on_delta(text.to_string());
+                    let Some(text) = value["delta"]["text"].as_str() else {
+                        // A text delta with no text is a malformed known frame.
+                        return Err(malformed_frame(LABEL));
+                    };
+                    if text.is_empty() {
+                        // Forwarding an empty delta wakes the UI for
+                        // nothing and cannot change the returned answer.
+                        return Ok(());
                     }
+                    delivered.mark_delta_emitted();
+                    progress.answer.push_str(text);
+                    // Pushed the moment it is decoded — never batched.
+                    sink.on_delta(text.to_string());
                 }
+                // Other delta types (thinking, citations, input_json) carry
+                // no spoken answer text and are harmless.
             }
             Some("error") => {
                 // Mid-stream server error. Surface the detail; without it the
@@ -244,17 +274,59 @@ impl AnthropicProvider {
                 let usage = if value["type"] == "message_start" {
                     &value["message"]["usage"]
                 } else {
+                    // Why the model stopped: metadata only. It does NOT
+                    // complete the answer — only `message_stop` does (R2).
+                    if let Some(reason) = value["delta"]["stop_reason"].as_str() {
+                        progress.stop_reason = Some(reason.to_string());
+                    }
                     &value["usage"]
                 };
                 if let Some(n) = usage["cache_read_input_tokens"].as_u64() {
                     *self.last_cache_read_input_tokens.lock().unwrap() = Some(n);
                 }
             }
-            // content_block_start / content_block_stop / ping / message_stop:
-            // structure and keep-alives, no answer text.
+            Some("message_stop") => progress.finished = true,
+            // content_block_start / content_block_stop / ping, and any event
+            // type added after this was written: structure and keep-alives,
+            // no answer text. Harmless by design.
             _ => {}
         }
         Ok(())
+    }
+}
+
+/// What one attempt has seen so far. The four R2 facts — protocol completion,
+/// answer text, stop reason, and whether anything arrived at all — are kept
+/// apart so no one of them can stand in for another.
+#[derive(Default)]
+struct StreamProgress {
+    answer: String,
+    stop_reason: Option<String>,
+    /// `message_stop` arrived.
+    finished: bool,
+    saw_event: bool,
+}
+
+impl StreamProgress {
+    /// Classify the attempt once the stream is over (R2).
+    fn conclude(self) -> AppResult<Answer> {
+        if !self.finished {
+            if !self.saw_event {
+                // A 200 with no SSE events is a broken response, not an empty
+                // answer — returning Ok("") here would render as the model
+                // silently saying nothing.
+                return Err(AppError::new(
+                    ErrorCode::LlmHttp,
+                    "Anthropic returned an empty response. Try again.",
+                ));
+            }
+            return Err(ended_early(LABEL));
+        }
+        Answer::from_terminal(
+            LABEL,
+            self.answer,
+            StopReason::from_provider(self.stop_reason.as_deref()),
+        )
     }
 }
 
@@ -265,7 +337,7 @@ impl LlmProvider for AnthropicProvider {
         req: &AnswerRequest,
         sink: Arc<dyn LlmSink>,
         cancel: CancellationToken,
-    ) -> AppResult<String> {
+    ) -> AppResult<Answer> {
         if self.api_key.trim().is_empty() {
             // Checked before any network work: a missing key is a settings
             // problem, and opening a connection to discover it wastes the
@@ -394,7 +466,7 @@ mod tests {
 
     fn request() -> AnswerRequest {
         let system = build_system_prompt(
-            Profile { resume: "Ten years of Rust.", job_description: "Staff engineer." },
+            Profile { resume: "Ten years of Rust.", job_description: "Staff engineer.", ..Default::default() },
             AnswerStyle::Balanced,
         );
         AnswerRequest::new(system).with_transcript("Tell me about yourself.")
@@ -499,13 +571,38 @@ mod tests {
         )
     }
 
+    const MESSAGE_STOP: &str = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+
+    fn message_delta(stop_reason: &str) -> String {
+        format!(
+            "event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{stop_reason}\"}},\"usage\":{{\"output_tokens\":2}}}}\n\n"
+        )
+    }
+
+    /// Resolves with the answer TEXT — the stop reason has its own tests.
     async fn run(
         provider: &AnthropicProvider,
         sink: Arc<RecordingSink>,
     ) -> AppResult<String> {
+        run_full(provider, sink).await.map(|a| a.text)
+    }
+
+    async fn run_full(
+        provider: &AnthropicProvider,
+        sink: Arc<RecordingSink>,
+    ) -> AppResult<Answer> {
         provider
             .stream_answer(&request(), sink, CancellationToken::new())
             .await
+    }
+
+    async fn run_body(body: &str) -> (AppResult<Answer>, Vec<String>) {
+        let (base, _rx) = serve_once(sse_response(body)).await;
+        let provider = AnthropicProvider::new("test-key").with_base_url(base);
+        let sink = Arc::new(RecordingSink::default());
+        let result = run_full(&provider, sink.clone()).await;
+        let deltas = sink.deltas.lock().unwrap().clone();
+        (result, deltas)
     }
 
     async fn status_error(status: u16, reason: &str, body: &str) -> AppError {
@@ -574,7 +671,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_pins_model_streaming_max_tokens_and_the_two_system_blocks() {
-        let (base, rx) = serve_once(sse_response(&delta_event("ok"))).await;
+        let (base, rx) = serve_once(sse_response(&format!("{}{MESSAGE_STOP}", delta_event("ok")))).await;
         let provider = AnthropicProvider::new("test-key").with_base_url(base);
         let req = request();
         provider
@@ -756,5 +853,134 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::NoLlmKey);
         assert!(err.message.contains("Anthropic"), "message was: {}", err.message);
+    }
+
+    // ---- R2: protocol completion vs stop reason ------------------------------
+
+    #[tokio::test]
+    async fn max_tokens_stop_completes_with_a_token_limit_reason() {
+        // A capped answer is kept and labelled "cut short" — it must not be
+        // reported as a failure, and must not be mistaken for a normal end.
+        let body = format!("{}{}{MESSAGE_STOP}", delta_event("Long answer"), message_delta("max_tokens"));
+        let (result, deltas) = run_body(&body).await;
+        let answer = result.expect("a capped answer is still an answer");
+        assert_eq!(answer.text, "Long answer");
+        assert_eq!(answer.stop_reason, StopReason::TokenLimit);
+        assert_eq!(deltas.concat(), answer.text);
+        let (normal, _) = run_body(&format!("{}{}{MESSAGE_STOP}", delta_event("x"), message_delta("end_turn"))).await;
+        assert_eq!(normal.unwrap().stop_reason, StopReason::Complete);
+    }
+
+    #[tokio::test]
+    async fn a_stop_reason_without_message_stop_is_still_incomplete() {
+        // The refinement over the first plan: `stop_reason` is metadata, not
+        // proof that the final protocol event arrived.
+        let body = format!("{}{}", delta_event("Almost"), message_delta("end_turn"));
+        let (result, deltas) = run_body(&body).await;
+        let err = result.unwrap_err();
+        assert_eq!(err.code, ErrorCode::LlmHttp);
+        assert!(err.message.contains("before the answer was finished"), "{}", err.message);
+        // The streamed text was delivered and stays on screen.
+        assert_eq!(deltas, vec!["Almost".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn clean_eof_before_message_stop_fails_but_keeps_the_streamed_text() {
+        let (result, deltas) = run_body(&format!("{}{}", delta_event("Hel"), delta_event("lo"))).await;
+        assert!(result.unwrap_err().message.contains("incomplete"));
+        assert_eq!(deltas.concat(), "Hello");
+    }
+
+    #[tokio::test]
+    async fn metadata_only_stream_is_an_explicit_failure_not_a_blank_answer() {
+        // Ping-only and message_start-only responses used to resolve Ok("").
+        let body = format!(
+            "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{}}}}}}\n\n\
+             event: ping\ndata: {{\"type\":\"ping\"}}\n\n{}{MESSAGE_STOP}",
+            message_delta("end_turn")
+        );
+        let (result, deltas) = run_body(&body).await;
+        let err = result.unwrap_err();
+        assert_eq!(err.code, ErrorCode::LlmHttp);
+        assert!(err.message.contains("without any answer text"), "{}", err.message);
+        assert!(deltas.is_empty());
+    }
+
+    #[tokio::test]
+    async fn nothing_after_message_stop_is_consumed() {
+        let body = format!("{}{MESSAGE_STOP}{}", delta_event("Done."), delta_event(" EXTRA"));
+        let (result, deltas) = run_body(&body).await;
+        assert_eq!(result.unwrap().text, "Done.");
+        assert_eq!(deltas, vec!["Done.".to_string()], "no delta after the terminator may paint");
+    }
+
+    #[tokio::test]
+    async fn malformed_known_frames_fail_instead_of_silently_dropping_text() {
+        // Unparseable JSON, and a text_delta with no text: each could have
+        // been answer text, so neither may be skipped on the way to "done".
+        for bad in [
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_de\n\n".to_string(),
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\"}}\n\n".to_string(),
+        ] {
+            let body = format!("{}{bad}{}{MESSAGE_STOP}", delta_event("A"), delta_event("B"));
+            let (result, deltas) = run_body(&body).await;
+            let err = result.unwrap_err();
+            assert!(err.message.contains("malformed"), "{}", err.message);
+            assert_eq!(deltas, vec!["A".to_string()], "text before the bad frame is kept");
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_event_types_and_non_text_deltas_are_harmless() {
+        let body = format!(
+            "event: brand_new\ndata: {{\"type\":\"brand_new_event\",\"x\":1}}\n\n\
+             event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"thinking_delta\",\"thinking\":\"hmm\"}}}}\n\n\
+             {}{MESSAGE_STOP}",
+            delta_event("Fine")
+        );
+        let (result, deltas) = run_body(&body).await;
+        assert_eq!(result.unwrap().text, "Fine");
+        assert_eq!(deltas, vec!["Fine".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_frame_is_refused_while_reading() {
+        // 1.1 MiB of one line, then the server stalls with the socket open:
+        // only a cap enforced while reading can return here instead of
+        // waiting (and buffering) forever.
+        let mut head = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 10000000\r\n\r\n{}data: ",
+            delta_event("Start")
+        )
+        .into_bytes();
+        head.extend_from_slice(&vec![b'x'; 1_100_000]);
+        let base = serve_then_stall(head).await;
+        let provider = AnthropicProvider::new("test-key").with_base_url(base);
+        let sink = Arc::new(RecordingSink::default());
+        let err = tokio::time::timeout(Duration::from_secs(20), run(&provider, sink.clone()))
+            .await
+            .expect("the cap must end the read")
+            .unwrap_err();
+        assert!(err.message.contains("oversized"), "{}", err.message);
+        assert_eq!(sink.deltas.lock().unwrap().clone(), vec!["Start".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn an_endless_error_body_is_read_only_up_to_the_cap() {
+        // A 500 promising 10 MB that sends 64 KiB and stalls: the old
+        // `response.text()` waited for the rest forever.
+        let mut head = b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 10000000\r\n\r\n".to_vec();
+        head.extend_from_slice(&vec![b'e'; 64 * 1024]);
+        let base = serve_then_stall(head).await;
+        let provider = AnthropicProvider::new("test-key").with_base_url(base);
+        let err = tokio::time::timeout(
+            Duration::from_secs(20),
+            run(&provider, Arc::new(RecordingSink::default())),
+        )
+        .await
+        .expect("a capped error body read must return")
+        .unwrap_err();
+        assert!(err.message.contains("HTTP 500"), "{}", err.message);
+        assert!(err.message.len() < 400, "message length was {}", err.message.len());
     }
 }

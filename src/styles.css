@@ -2,6 +2,7 @@
  * AI Call Assistant — single hand-written dark stylesheet.
  * Designed for a narrow 460x700 column (min 380x520): one column, generous
  * vertical rhythm, nothing side-by-side that can't wrap.
+ * Settings-only rules live in views/SettingsView.css (code-split with it).
  */
 
 :root {
@@ -29,11 +30,23 @@
   --warn: #e5b567;
   --rec: #ef4444;
 
+  /* "Everything is fine" green family: local-mode banner and setup panel. */
+  --ok: #9ee3c2;
+  --ok-bg: #18322c;
+  --ok-border: #366b5c;
+
   --radius: 8px;
 }
 
 * {
   box-sizing: border-box;
+}
+
+/* The `hidden` attribute is how focus mode and the transcript strip take
+   rows out of the layout; without this, any `display` rule on the element
+   would silently win over the attribute. */
+[hidden] {
+  display: none !important;
 }
 
 html,
@@ -63,6 +76,15 @@ body {
   gap: 10px;
   padding: 14px 16px 16px;
   min-height: 100vh;
+}
+
+/* Main view: a fixed-height column so the answer panel (flex: 1) absorbs
+   every spare pixel — tall or short window, the answer grows, not dead
+   space. Scrolls only when the minimum content genuinely does not fit. */
+.main-view {
+  height: 100vh;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .app-header {
@@ -154,6 +176,13 @@ textarea:focus-visible {
   background: var(--bg-raised);
 }
 
+/* The focus-mode toggle is a stateful icon: lit while on. */
+.icon-button[aria-pressed='true'] {
+  color: var(--accent-text);
+  background: rgba(143, 181, 255, 0.12);
+  border-color: var(--accent-text);
+}
+
 .primary-button {
   background: var(--accent);
   border: 1px solid transparent;
@@ -178,22 +207,30 @@ textarea:focus-visible {
   background: var(--bg-raised);
 }
 
-/* ------------------------------------------------------- record button --- */
+/* ------------------------------------------------------- control row ----- */
+
+/* Record + style chips on one line; the answer above owns the height. */
+.control-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
 
 .record-button {
-  display: flex;
+  display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 10px;
-  width: 100%;
-  padding: 14px 12px;
+  padding: 10px 16px;
   background: var(--accent);
   border: 1px solid transparent;
   color: #ffffff;
-  /* 17px semibold qualifies as "large text", but the fill also clears AA at
-     normal size — belt and braces for the one button that matters. */
-  font-size: 17px;
+  /* 15px semibold on the accent fill clears AA at normal size — the one
+     button that matters keeps its contrast at the compact size. */
+  font-size: 15px;
   font-weight: 600;
+  white-space: nowrap;
   transition: background 120ms ease;
 }
 
@@ -233,10 +270,13 @@ textarea:focus-visible {
 
 /* ------------------------------------------------------ recording row ---- */
 
+/* Always in the flow with its height reserved: the meter mounting must not
+   shove the answer the reader is mid-sentence in. */
 .recording-row {
   display: flex;
   align-items: center;
   gap: 10px;
+  min-height: 20px;
 }
 
 .level-meter {
@@ -264,6 +304,12 @@ textarea:focus-visible {
 }
 
 /* ---------------------------------------------------------- ask form ----- */
+
+.ask-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
 
 .ask-form {
   display: flex;
@@ -303,12 +349,18 @@ textarea::placeholder {
   border-color: var(--accent-text);
 }
 
-/* -------------------------------------------------------- style chips ---- */
-
-.style-chips {
-  display: flex;
-  gap: 8px;
+/* Shared help line (Settings, the local panel, and the main-view hints). */
+.field-help {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-dim);
 }
+
+.hint {
+  line-height: 1.4;
+}
+
+/* -------------------------------------------------------- chips ---------- */
 
 .chip {
   font-size: 12.5px;
@@ -316,19 +368,55 @@ textarea::placeholder {
   padding: 4px 12px;
 }
 
+/* Style chips as a segmented control: one pill, three cells. */
+.style-chips {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+}
+
 .style-chip {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-dim);
+  padding: 3px 11px;
+}
+
+.style-chip[aria-pressed='true'] {
+  color: var(--accent-text);
+  background: rgba(143, 181, 255, 0.14);
+}
+
+.style-chip:hover:not(:disabled) {
+  color: var(--text);
+}
+
+/* Profile chips: one per call profile, wrapping, names ellipsised. */
+.profile-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.profile-chip {
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   background: transparent;
   border: 1px solid var(--border);
   color: var(--text-dim);
 }
 
-.style-chip[aria-pressed='true'] {
+.profile-chip[aria-pressed='true'] {
   border-color: var(--accent-text);
   color: var(--accent-text);
   background: rgba(143, 181, 255, 0.1);
 }
 
-.style-chip:hover:not(:disabled) {
+.profile-chip:hover:not(:disabled) {
   color: var(--text);
 }
 
@@ -364,7 +452,9 @@ textarea::placeholder {
 .panel-actions {
   margin-left: auto;
   display: flex;
+  align-items: center;
   gap: 6px;
+  flex-wrap: wrap;
 }
 
 .tag {
@@ -378,6 +468,25 @@ textarea::placeholder {
 .tag-live {
   color: #ff9d9d; /* red family but bright enough for AA on the raised panel */
   animation: pulse 1.2s ease-in-out infinite;
+}
+
+/* R2 entry outcome: an interrupted or capped answer stays recognisable. */
+.status-incomplete {
+  color: var(--danger);
+}
+
+.status-limited {
+  color: var(--warn);
+}
+
+.status-cancelled {
+  color: var(--text-dim);
+}
+
+.answer-caption {
+  margin: 0;
+  padding: 0 12px 8px;
+  font-size: 12px;
 }
 
 .latency-chip {
@@ -394,14 +503,78 @@ textarea::placeholder {
   overscroll-behavior: contain;
 }
 
-.transcript-body {
-  min-height: 3.6em;
-  max-height: 110px;
+/* Answer first and largest: the reading surface at eye level. */
+.answer-panel {
+  flex: 1 1 auto;
+  min-height: 9em;
 }
 
 .answer-body {
-  min-height: 7em;
-  max-height: 240px;
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+  font-size: 16px;
+  line-height: 1.5;
+}
+
+/* Focus mode: the answer is the only thing on screen, so it can be read
+   from further back. */
+.main-view--focus .answer-body {
+  font-size: 18px;
+}
+
+/* Transcript demoted: a compact confidence strip under the controls. The head
+   is a plain container; the disclosure button lives inside the <h2> (so the
+   heading stays in the a11y tree and the button's name stays "Question
+   heard") and stretches over the whole strip with ::after so the click
+   target is still the full row, caption and chevron included. */
+.transcript-head {
+  position: relative;
+  width: 100%;
+  border-radius: var(--radius) var(--radius) 0 0;
+  padding: 8px 12px;
+}
+
+.transcript-head:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.transcript-toggle {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  text-align: left;
+}
+
+.transcript-toggle::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+}
+
+.transcript-caption {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+
+.transcript-chevron {
+  margin-left: auto;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.transcript-body {
+  min-height: 2.6em;
+  max-height: 72px;
+  font-size: 12.5px;
 }
 
 .transcript-text {
@@ -441,20 +614,20 @@ textarea::placeholder {
 /* Through h6: the renderer demotes model headings (`#`→h3 … capped at h6,
    §10), so the depths models actually emit — `###` and deeper — land on
    h5/h6; left unstyled they render at UA defaults, smaller than body text
-   with outsized margins. */
+   with outsized margins. Kept at (not below) body size. */
 .answer-body h1,
 .answer-body h2,
 .answer-body h3,
 .answer-body h4,
 .answer-body h5,
 .answer-body h6 {
-  font-size: 13.5px;
+  font-size: 1em;
   margin: 10px 0 6px;
 }
 
 .answer-body code {
   font-family: Consolas, 'Cascadia Mono', monospace;
-  font-size: 12.5px;
+  font-size: 0.9em;
   background: var(--bg-inset);
   border-radius: 4px;
   padding: 1px 5px;
@@ -506,11 +679,13 @@ textarea::placeholder {
 
 /* --------------------------------------------------------- history bar --- */
 
+/* Inline in the answer panel's head (§9): prev/next sit next to the answer
+   they page. The answer panel owns the column's slack now. */
 .history-bar {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin-top: auto; /* pinned to the bottom of the column */
+  gap: 6px;
+  margin-top: 0;
 }
 
 .history-arrow {
@@ -525,73 +700,22 @@ textarea::placeholder {
   font-variant-numeric: tabular-nums;
 }
 
-.history-clear {
-  margin-left: auto;
-}
+/* ------------------------------------------------------ local mode ------- */
 
-/* ----------------------------------------------------------- settings ---- */
-
-.settings-form {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  overflow-y: auto;
-}
-
-.field {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.field input,
-.field select,
-.field textarea {
-  width: 100%;
-}
-
-.field textarea {
-  resize: vertical;
-}
-
-.field--checkbox {
-  flex-direction: row;
-  align-items: center;
-  gap: 8px;
-}
-
-.field--checkbox input {
-  width: auto;
-  accent-color: var(--accent);
-}
-
-.field-label {
-  font-size: 12.5px;
-  font-weight: 600;
-  color: var(--text);
-}
-
-.field-help {
-  margin: 0;
+.local-mode-banner {
+  padding: 9px 12px;
+  border: 1px solid var(--ok-border);
+  border-radius: 8px;
   font-size: 12px;
-  color: var(--text-dim);
+  line-height: 1.5;
 }
 
-.settings-note {
-  margin: 0;
-  font-size: 12px;
-  color: var(--text-dim);
+.local-mode-banner strong {
+  color: var(--ok);
 }
 
-.settings-actions {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.saved-note {
-  color: #6fce91; /* bright green: ≥7:1 on --bg, readable at 13px */
-  font-size: 13px;
+.local-mode-banner p {
+  margin: 2px 0 6px;
 }
 
 /* ------------------------------------------------------- accessibility --- */

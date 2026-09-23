@@ -3,13 +3,12 @@ import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { ComponentProps } from 'react';
 import { HistoryBar } from './HistoryBar';
-import { makeEntry } from '../views/testUtils';
 
 type BarProps = ComponentProps<typeof HistoryBar>;
 
 function renderBar(overrides: Partial<BarProps> = {}) {
   const props: BarProps = {
-    history: [makeEntry({ key: 'a' }), makeEntry({ key: 'b' })],
+    historyLength: 2,
     viewIndex: 0,
     idle: true,
     onPrev: vi.fn(),
@@ -22,7 +21,7 @@ function renderBar(overrides: Partial<BarProps> = {}) {
 
 describe('HistoryBar', () => {
   it('hides below two entries', () => {
-    renderBar({ history: [makeEntry()] });
+    renderBar({ historyLength: 1 });
     expect(screen.queryByRole('navigation')).not.toBeInTheDocument();
   });
 
@@ -33,8 +32,7 @@ describe('HistoryBar', () => {
 
   it('disables the arrows at the ends and fires them in between', async () => {
     const user = userEvent.setup();
-    const three = [makeEntry({ key: 'a' }), makeEntry({ key: 'b' }), makeEntry({ key: 'c' })];
-    const { props } = renderBar({ history: three, viewIndex: 1 });
+    const { props } = renderBar({ historyLength: 3, viewIndex: 1 });
     await user.click(screen.getByRole('button', { name: 'Previous answer' }));
     await user.click(screen.getByRole('button', { name: 'Next answer' }));
     expect(props.onPrev).toHaveBeenCalledTimes(1);

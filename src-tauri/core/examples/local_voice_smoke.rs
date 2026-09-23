@@ -35,6 +35,7 @@ fn deps(events: Arc<dyn EventSink>, style: AnswerStyle) -> SessionDeps {
         events, answer_request: AnswerRequest::new(build_system_prompt(Profile {
             resume:"Customer support specialist. I listen carefully, clarify the problem, explain available options, and follow up. I escalate issues when needed.",
             job_description:"Customer support role requiring empathy and clear communication.",
+            ..Default::default()
         },style)),
     }
 }

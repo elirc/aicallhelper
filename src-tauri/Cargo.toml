@@ -3,7 +3,7 @@ members = ["core"]
 
 [package]
 name = "aicallhelper"
-version = "3.0.0"
+version = "3.1.0"
 description = "AI Call Assistant — push-to-record interview copilot"
 authors = ["you"]
 edition = "2021"

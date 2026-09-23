@@ -18,9 +18,16 @@
 //!   nothing at all once it doesn't.
 //! - **Slot release** (§5.11): whatever the outcome, the active slot is
 //!   released exactly once, so the next session never supersedes a ghost.
+//! - **Recorded outcome** (R1, ADR 015): the slot release and the session's
+//!   terminal outcome are written in one critical section, so a lookup can
+//!   never see "not active" without also seeing how the session ended.
+//! - **Supervised driver** (R1): a drop guard settles the session and aborts
+//!   its STT stream if the driver task exits any other way — including a
+//!   panic unwinding out of a provider — so a crash is an error, not a hang.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::oneshot::error::TryRecvError;
 use tokio::sync::{mpsc, oneshot};
@@ -31,18 +38,76 @@ use crate::error::{AppError, ErrorCode, MSG_NO_SPEECH};
 use crate::llm::{AnswerRequest, LlmProvider, LlmSink};
 use crate::stt::{SttSink, SttStream};
 
-use super::{limits, EventSink, Metrics, SessionDeps, SessionEvent, SessionId, StopOutcome};
+use super::{
+    limits, EventSink, Metrics, SessionDeps, SessionEvent, SessionId, SessionOutcome, StopOutcome,
+    OUTCOME_RETENTION,
+};
 
-/// The one-slot session registry. `Mutex<Option<Active>>` rather than a map:
-/// the product rule is "one live pipeline", and encoding it in the type means
+/// Shown when a driver task ended without settling its session — a provider
+/// that panicked, or one that returned `aborted` nobody asked for. Without the
+/// guard that emits it, the UI would wait on a session nobody is driving.
+pub const MSG_DRIVER_STOPPED: &str = "The answer stopped unexpectedly. Try again.";
+
+/// Lock that survives poisoning. The driver guard runs during a panic's
+/// unwind; if the panic happened while a lock here was held, a plain
+/// `unwrap()` would panic again inside `Drop` and abort the whole process.
+/// Every guarded value is valid at each intermediate step, so recovering the
+/// data is sound.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The one-slot session registry. `Option<Active>` rather than a map: the
+/// product rule is "one live pipeline", and encoding it in the type means
 /// supersession cannot be forgotten on any path.
 pub struct SessionManager {
     inner: Arc<Inner>,
 }
 
 struct Inner {
-    slot: Mutex<Option<Active>>,
+    slot: Mutex<Slot>,
     next_id: AtomicU64,
+}
+
+/// The live session and the recent outcomes, under ONE lock: every write
+/// that releases the slot records the outcome in the same critical section
+/// (R1), so no reader can observe the two out of step.
+struct Slot {
+    active: Option<Active>,
+    /// Bounded by `OUTCOME_RETENTION`, oldest first. Keyed by id rather than
+    /// a single "last outcome": a completion of one session can never
+    /// overwrite the outcome another pending adoption still needs.
+    outcomes: VecDeque<(SessionId, SessionOutcome)>,
+}
+
+impl Slot {
+    /// Record a newly claimed session as Active, retiring the oldest outcome
+    /// beyond the bound.
+    fn open(&mut self, id: SessionId) {
+        self.outcomes.push_back((id, SessionOutcome::Active));
+        while self.outcomes.len() > OUTCOME_RETENTION {
+            self.outcomes.pop_front();
+        }
+    }
+
+    /// Settle once: only an Active outcome may change. The first terminal
+    /// write wins, so a late path (a second error, the driver guard after a
+    /// normal completion) can never rewrite how a session ended.
+    fn settle(&mut self, id: SessionId, outcome: SessionOutcome) {
+        if let Some((_, current)) = self.outcomes.iter_mut().find(|(i, _)| *i == id) {
+            if *current == SessionOutcome::Active {
+                *current = outcome;
+            }
+        }
+    }
+
+    fn outcome(&self, id: SessionId) -> SessionOutcome {
+        self.outcomes
+            .iter()
+            .find(|(i, _)| *i == id)
+            .map(|(_, o)| o.clone())
+            .unwrap_or(SessionOutcome::Unknown)
+    }
 }
 
 /// Where the live session currently is. The phase decides what `stop` and
@@ -52,10 +117,31 @@ enum Phase {
     /// STT connect still in flight. No stream, no audio, `stop` is NotTaken.
     Connecting,
     /// Recording live. Audio routes here; `stop` is Taken exactly once.
-    Recording { stream: Arc<dyn SttStream> },
+    Recording { stream: Arc<OwnedStream> },
     /// Stop accepted (or the question was typed): finalize/answer in flight.
     /// Audio is dropped — a late frame would race the CloseStream flush (§5.4).
     Finishing,
+}
+
+/// An STT stream whose abort runs at most once. Supersession, cancel, a
+/// device error, the driver's own error paths and the driver guard can all
+/// decide the stream must die, sometimes at the same moment; the socket is
+/// torn down by exactly one of them (R1: resources released exactly once).
+struct OwnedStream {
+    stream: Arc<dyn SttStream>,
+    aborted: AtomicBool,
+}
+
+impl OwnedStream {
+    fn new(stream: Arc<dyn SttStream>) -> Arc<Self> {
+        Arc::new(Self { stream, aborted: AtomicBool::new(false) })
+    }
+
+    fn abort(&self) {
+        if !self.aborted.swap(true, Ordering::AcqRel) {
+            self.stream.abort();
+        }
+    }
 }
 
 struct Active {
@@ -77,29 +163,68 @@ struct Active {
 /// Emission gate for one session. Killed on supersession, cancel, and error,
 /// so a delta that races in after the session's fate was decided paints
 /// nothing (§5.9) — and a superseded session's `done` never fires (§5.1).
+///
+/// It also remembers what it let through (the latest transcript and the
+/// answer text so far), so a failure's recorded outcome carries exactly the
+/// text the UI was shown (R1). The check, the emit and the record happen
+/// under one lock, and `kill_and_snapshot` takes the same lock: a delta is
+/// either shown AND in the snapshot, or neither.
 struct Gate {
     id: SessionId,
     sink: Arc<dyn EventSink>,
-    dead: AtomicBool,
+    state: Mutex<GateState>,
+}
+
+#[derive(Default)]
+struct GateState {
+    dead: bool,
+    transcript: String,
+    answer: String,
 }
 
 impl Gate {
     fn new(id: SessionId, sink: Arc<dyn EventSink>) -> Arc<Self> {
-        Arc::new(Self { id, sink, dead: AtomicBool::new(false) })
+        Arc::new(Self { id, sink, state: Mutex::new(GateState::default()) })
     }
 
     fn is_dead(&self) -> bool {
-        self.dead.load(Ordering::Acquire)
+        lock(&self.state).dead
     }
 
     fn emit(&self, event: SessionEvent) {
-        if !self.is_dead() {
-            self.sink.emit(event);
+        let mut state = lock(&self.state);
+        if state.dead {
+            return;
+        }
+        let shown = match &event {
+            SessionEvent::SttPartial { text, .. } => Some((true, text.clone())),
+            SessionEvent::LlmDelta { delta, .. } => Some((false, delta.clone())),
+            _ => None,
+        };
+        self.sink.emit(event);
+        // Recorded AFTER the sink accepted it: a sink that panics mid-emit
+        // must not leave the outcome claiming text the UI never received.
+        match shown {
+            Some((true, text)) => state.transcript = text,
+            Some((false, delta)) => state.answer.push_str(&delta),
+            None => {}
         }
     }
 
     fn kill(&self) {
-        self.dead.store(true, Ordering::Release);
+        lock(&self.state).dead = true;
+    }
+
+    /// The latest transcript the gate let through.
+    fn transcript(&self) -> String {
+        lock(&self.state).transcript.clone()
+    }
+
+    /// Kill the gate and return what it had let through: (transcript, answer).
+    fn kill_and_snapshot(&self) -> (String, String) {
+        let mut state = lock(&self.state);
+        state.dead = true;
+        (state.transcript.clone(), state.answer.clone())
     }
 }
 
@@ -121,16 +246,24 @@ impl Inner {
         self.next_id.fetch_add(1, Ordering::Relaxed) + 1
     }
 
+    /// Install a newly claimed session, recording it Active and the session it
+    /// displaced as Cancelled (superseded) in the same critical section.
     fn replace(&self, active: Active) -> Option<Active> {
-        self.slot.lock().unwrap().replace(active)
+        let mut slot = lock(&self.slot);
+        slot.open(active.id);
+        let previous = slot.active.replace(active);
+        if let Some(previous) = &previous {
+            slot.settle(previous.id, SessionOutcome::Cancelled);
+        }
+        previous
     }
 
     /// Install the freshly connected stream — but only if this session is
     /// still the one in the slot (§5.2). A start that lost while connecting
     /// gets `false` and must tear its own stream down.
-    fn install_stream(&self, id: SessionId, stream: Arc<dyn SttStream>) -> bool {
-        let mut slot = self.slot.lock().unwrap();
-        match slot.as_mut() {
+    fn install_stream(&self, id: SessionId, stream: Arc<OwnedStream>) -> bool {
+        let mut slot = lock(&self.slot);
+        match slot.active.as_mut() {
             Some(active) if active.id == id && matches!(active.phase, Phase::Connecting) => {
                 active.phase = Phase::Recording { stream };
                 true
@@ -142,8 +275,8 @@ impl Inner {
     /// Flip Recording -> Finishing for the auto-stop path (MAX_RECORDING).
     /// Returns false if the session already stopped, was cancelled, or lost.
     fn begin_finishing(&self, id: SessionId) -> bool {
-        let mut slot = self.slot.lock().unwrap();
-        match slot.as_mut() {
+        let mut slot = lock(&self.slot);
+        match slot.active.as_mut() {
             Some(active) if active.id == id && matches!(active.phase, Phase::Recording { .. }) => {
                 active.phase = Phase::Finishing;
                 true
@@ -152,15 +285,17 @@ impl Inner {
         }
     }
 
-    /// The single point where a session leaves the slot on its own terms.
-    /// Because it is keyed by id, every terminal path can call it and the slot
-    /// is still released exactly once (§5.11) — a second call, or a call after
-    /// supersession already emptied the slot, is a no-op.
-    fn release_if_current(&self, id: SessionId) -> bool {
-        let mut slot = self.slot.lock().unwrap();
-        match slot.as_ref() {
+    /// The single point where a session leaves the slot on its own terms, and
+    /// the single point its terminal outcome is recorded. Because it is keyed
+    /// by id, every terminal path can call it and the slot is still released
+    /// exactly once (§5.11) — a second call, or a call after supersession
+    /// already emptied the slot, is a no-op and records nothing.
+    fn release_with(&self, id: SessionId, outcome: SessionOutcome) -> bool {
+        let mut slot = lock(&self.slot);
+        match slot.active.as_ref() {
             Some(active) if active.id == id => {
-                *slot = None;
+                slot.active = None;
+                slot.settle(id, outcome);
                 true
             }
             _ => false,
@@ -171,24 +306,105 @@ impl Inner {
     /// (§5.6): only the session that still holds the slot may speak, so a
     /// superseded session's socket death, or a second death of the same
     /// stream, emits nothing. `aborted` never surfaces — it is the pipeline's
-    /// non-error way to unwind, and the UI must never render it.
+    /// non-error way to unwind, and the UI must never render it; it is
+    /// recorded as Cancelled.
     fn fail(&self, id: SessionId, gate: &Gate, error: AppError) {
-        let owned = self.release_if_current(id);
-        // Kill the gate before the error goes out so no delta paints after it
-        // (§5.9), even one already in flight on another thread.
-        gate.kill();
-        if owned && !error.is_aborted() {
-            gate.sink.emit(SessionEvent::SessionError { session_id: id, error });
+        if let Some(event) = self.settle_failure(id, gate, error) {
+            gate.sink.emit(event);
         }
     }
 
-    /// Terminal success path: release the slot, then emit `done` — but only if
-    /// this session still owned the slot. A superseded session's `done` is the
-    /// most misleading event there is (§5.1): it repaints an answer the user
-    /// already abandoned.
+    /// The settling half of `fail`, without the emit: kill the gate, record
+    /// the outcome, release the slot. Returns the `session:error` to emit when
+    /// this session still owned the slot and the error is not `aborted`.
+    /// Nothing here can panic (poison-tolerant locks, no sink call), which is
+    /// what lets the driver guard run it during a panic's unwind (R1 review
+    /// F1) and hand the emit to a fresh task.
+    fn settle_failure(&self, id: SessionId, gate: &Gate, error: AppError) -> Option<SessionEvent> {
+        // Kill the gate before the error goes out so no delta paints after it
+        // (§5.9), even one already in flight on another thread — and take the
+        // text it let through in the same step, for the recorded outcome.
+        let (transcript, partial) = gate.kill_and_snapshot();
+        let outcome = if error.is_aborted() {
+            SessionOutcome::Cancelled
+        } else {
+            SessionOutcome::Failed { error: error.clone(), transcript, partial }
+        };
+        let owned = self.release_with(id, outcome);
+        (owned && !error.is_aborted())
+            .then_some(SessionEvent::SessionError { session_id: id, error })
+    }
+
+    /// Terminal success path: release the slot and record the outcome, then
+    /// emit `done` — but only if this session still owned the slot. A
+    /// superseded session's `done` is the most misleading event there is
+    /// (§5.1): it repaints an answer the user already abandoned.
     fn complete(&self, id: SessionId, gate: &Gate, event: SessionEvent) {
-        if self.release_if_current(id) {
+        let SessionEvent::LlmDone { transcript, answer, metrics, stop_reason, .. } = &event else {
+            return;
+        };
+        let outcome = SessionOutcome::Completed {
+            transcript: transcript.clone(),
+            answer: answer.clone(),
+            metrics: *metrics,
+            stop_reason: *stop_reason,
+        };
+        if self.release_with(id, outcome) {
             gate.emit(event);
+        }
+    }
+}
+
+/// Supervises one driver task (R1). Created first thing inside the spawned
+/// task and dropped last, so its `Drop` runs on EVERY exit: a normal return,
+/// an early return, and a panic unwinding out of a provider or connector.
+///
+/// On drop it settles the session with `MSG_DRIVER_STOPPED` — a no-op after
+/// any normal terminal path, because `fail` only speaks for a session that
+/// still owns the slot — then cancels the session's work and aborts the STT
+/// stream if the driver still held one. It never panics itself: every lock it
+/// takes is poison-tolerant, since a second panic during an unwind aborts the
+/// process. Cancellation and supersession keep their silence: a session that
+/// already lost the slot records nothing new and emits nothing.
+struct DriverGuard {
+    inner: Arc<Inner>,
+    id: SessionId,
+    gate: Arc<Gate>,
+    cancel: CancellationToken,
+    /// The STT stream while it is still this driver's to release. Cleared
+    /// once finalize closed it normally.
+    stream: Option<Arc<OwnedStream>>,
+}
+
+impl DriverGuard {
+    fn new(inner: Arc<Inner>, id: SessionId, gate: Arc<Gate>, cancel: CancellationToken) -> Self {
+        Self { inner, id, gate, cancel, stream: None }
+    }
+}
+
+impl Drop for DriverGuard {
+    fn drop(&mut self) {
+        // Settle synchronously — slot, outcome, gate — so the session is over
+        // the moment this task is.
+        let error = AppError::internal(MSG_DRIVER_STOPPED);
+        let event = self.inner.settle_failure(self.id, &self.gate, error);
+        self.cancel.cancel();
+        if let Some(stream) = self.stream.take() {
+            stream.abort();
+        }
+        let Some(event) = event else { return };
+        if std::thread::panicking() {
+            // Mid-unwind (tokio drops the task's future inside its panic
+            // guard). The sink is outside our control — the Tauri emit path
+            // locks with `unwrap` — and a second panic here would abort the
+            // whole process. Emit from a fresh task instead, where a panic is
+            // caught by tokio like any other (R1 review F1).
+            let sink = self.gate.sink.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move { sink.emit(event) });
+            }
+        } else {
+            self.gate.sink.emit(event);
         }
     }
 }
@@ -196,7 +412,10 @@ impl Inner {
 impl SessionManager {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Inner { slot: Mutex::new(None), next_id: AtomicU64::new(0) }),
+            inner: Arc::new(Inner {
+                slot: Mutex::new(Slot { active: None, outcomes: VecDeque::new() }),
+                next_id: AtomicU64::new(0),
+            }),
         }
     }
 
@@ -231,7 +450,8 @@ impl SessionManager {
 
         let inner = self.inner.clone();
         tokio::spawn(async move {
-            drive_recording(inner, id, deps, cancel, gate, stop_rx).await;
+            let mut guard = DriverGuard::new(inner.clone(), id, gate.clone(), cancel.clone());
+            drive_recording(inner, id, deps, cancel, gate, stop_rx, &mut guard).await;
         });
         Ok(id)
     }
@@ -242,8 +462,8 @@ impl SessionManager {
     /// coming", and this return value is the only channel that can say so.
     pub async fn stop(&self, id: SessionId) -> StopOutcome {
         let llm = {
-            let mut slot = self.inner.slot.lock().unwrap();
-            match slot.as_mut() {
+            let mut slot = lock(&self.inner.slot);
+            match slot.active.as_mut() {
                 Some(active)
                     if active.id == id && matches!(active.phase, Phase::Recording { .. }) =>
                 {
@@ -304,13 +524,20 @@ impl SessionManager {
             teardown(previous);
         }
 
-        deps.llm.prewarm();
+        // Deliberately NO prewarm here (RS-1; §6.4 warms Record, Stop and
+        // auto-stop). The answer request fires from the task spawned a few
+        // lines down, microseconds from now: a warm fired first cannot finish
+        // a handshake before it, so it only races the real request for the
+        // pool — a spawn on the ask path and, when the 2 s throttle lets it
+        // through, a second connection to the same origin, for nothing. The
+        // other three sites have a human-length gap to overlap.
 
         // Metrics for a typed question count from submission — the moral
         // equivalent of the stop instant.
         let asked_at = Instant::now();
         let inner = self.inner.clone();
         tokio::spawn(async move {
+            let _guard = DriverGuard::new(inner.clone(), id, gate.clone(), cancel.clone());
             gate.emit(SessionEvent::SttPartial {
                 session_id: id,
                 text: question.clone(),
@@ -324,12 +551,17 @@ impl SessionManager {
     }
 
     /// Cancel is fire-and-forget and silent (§5.10): no done, no error, work
-    /// aborted, slot released. Stale ids are ignored.
+    /// aborted, slot released, outcome recorded as Cancelled. Stale ids are
+    /// ignored.
     pub fn cancel(&self, id: SessionId) {
         let removed = {
-            let mut slot = self.inner.slot.lock().unwrap();
-            match slot.as_ref() {
-                Some(active) if active.id == id => slot.take(),
+            let mut slot = lock(&self.inner.slot);
+            match slot.active.as_ref() {
+                Some(active) if active.id == id => {
+                    let removed = slot.active.take();
+                    slot.settle(id, SessionOutcome::Cancelled);
+                    removed
+                }
                 _ => None,
             }
         };
@@ -344,9 +576,19 @@ impl SessionManager {
     /// layer where the capture swap lives.
     pub fn is_active(&self, id: SessionId) -> bool {
         matches!(
-            self.inner.slot.lock().unwrap().as_ref(),
+            lock(&self.inner.slot).active.as_ref(),
             Some(active) if active.id == id
         )
+    }
+
+    /// How `id` ended, or `Active` if it is still running (R1, ADR 015).
+    ///
+    /// Read under the same lock that releases the slot, so it is always
+    /// consistent with `is_active`. Ids older than the last
+    /// `OUTCOME_RETENTION` claimed sessions (and ids never issued) are
+    /// `Unknown`. Idempotent: a lookup never changes anything.
+    pub fn outcome(&self, id: SessionId) -> SessionOutcome {
+        lock(&self.inner.slot).outcome(id)
     }
 
     /// Report a capture-device death (unplugged headset, disabled output).
@@ -359,9 +601,24 @@ impl SessionManager {
     /// the terminal event releases it, and a device death in that window must
     /// not kill an answer that is already streaming. Stale ids are ignored.
     pub fn device_error(&self, id: SessionId, error: AppError) {
+        // Read what the settle needs BEFORE taking the slot lock: taking a
+        // gate lock under the slot lock would invert the gate -> audio -> slot
+        // order the shell creates. During Connecting/Recording there is no
+        // answer yet, so only the transcript can be a hair stale.
+        let gate = {
+            let slot = lock(&self.inner.slot);
+            match slot.active.as_ref() {
+                Some(active) if active.id == id => active.gate.clone(),
+                _ => return,
+            }
+        };
+        let transcript = gate.transcript();
+        // The phase check and the release are ONE critical section (R1 review
+        // F5): a Stop accepted between a separate check and the release used
+        // to let a post-stop device death kill an answer §5.5 says survives.
         let target = {
-            let slot = self.inner.slot.lock().unwrap();
-            match slot.as_ref() {
+            let mut slot = lock(&self.inner.slot);
+            let target = match slot.active.as_ref() {
                 Some(active)
                     if active.id == id
                         && matches!(
@@ -373,16 +630,27 @@ impl SessionManager {
                         Phase::Recording { stream } => Some(stream.clone()),
                         _ => None,
                     };
-                    Some((active.gate.clone(), active.cancel.clone(), stream))
+                    Some((active.cancel.clone(), stream))
                 }
                 _ => None,
+            };
+            if target.is_some() {
+                slot.active = None;
+                slot.settle(
+                    id,
+                    SessionOutcome::Failed { error: error.clone(), transcript, partial: String::new() },
+                );
             }
+            target
         };
-        let Some((gate, cancel, stream)) = target else { return };
-        // fail() first: it takes slot ownership exactly once, kills the gate,
-        // and emits the one error (§5.6). The cancel/abort afterwards are pure
-        // cleanup — the driver they wake exits through its silent paths.
-        self.inner.fail(id, &gate, error);
+        let Some((cancel, stream)) = target else { return };
+        // The slot is already ours to report on: kill the gate so nothing
+        // paints after the error, emit the one error (§5.6), then clean up —
+        // the driver the cancel wakes exits through its silent paths.
+        gate.kill();
+        if !error.is_aborted() {
+            gate.sink.emit(SessionEvent::SessionError { session_id: id, error });
+        }
         cancel.cancel();
         if let Some(stream) = stream {
             stream.abort();
@@ -395,8 +663,8 @@ impl SessionManager {
     /// flush and smear the tail of one question into the next.
     pub fn push_audio(&self, id: SessionId, pcm: &[i16], rms: f32) {
         let target = {
-            let slot = self.inner.slot.lock().unwrap();
-            match slot.as_ref() {
+            let slot = lock(&self.inner.slot);
+            match slot.active.as_ref() {
                 Some(active) if active.id == id => match &active.phase {
                     Phase::Recording { stream } => Some((stream.clone(), active.gate.clone())),
                     _ => None,
@@ -405,7 +673,7 @@ impl SessionManager {
             }
         };
         if let Some((stream, gate)) = target {
-            stream.send_audio(pcm);
+            stream.stream.send_audio(pcm);
             gate.emit(SessionEvent::AudioLevel { session_id: id, rms });
         }
     }
@@ -458,7 +726,7 @@ impl LlmSink for SessionLlmSink {
         if self.gate.is_dead() {
             return;
         }
-        if let Some(tx) = self.first.lock().unwrap().take() {
+        if let Some(tx) = lock(&self.first).take() {
             let _ = tx.send(Instant::now());
         }
         self.gate.emit(SessionEvent::LlmDelta { session_id: self.gate.id, delta });
@@ -474,8 +742,9 @@ fn ms_since(from: Instant) -> u64 {
 }
 
 /// Drives one recording session: connect, record, finalize, answer. Runs as a
-/// detached task; every exit path either emitted a terminal event through the
-/// slot-ownership check or was silenced by losing the slot first.
+/// detached task under a `DriverGuard`; every exit path either emitted a
+/// terminal event through the slot-ownership check, was silenced by losing
+/// the slot first, or is settled by the guard.
 async fn drive_recording(
     inner: Arc<Inner>,
     id: SessionId,
@@ -483,6 +752,7 @@ async fn drive_recording(
     cancel: CancellationToken,
     gate: Arc<Gate>,
     mut stop_rx: oneshot::Receiver<Instant>,
+    guard: &mut DriverGuard,
 ) {
     // ---- Connect -----------------------------------------------------------
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -493,8 +763,8 @@ async fn drive_recording(
     // allowed to finish its round-trip so that it can tear down the socket it
     // opened. The loss is discovered at install time (§5.2).
     let connected = tokio::time::timeout(limits::STT_CONNECT, deps.stt.connect(sink)).await;
-    let stream: Arc<dyn SttStream> = match connected {
-        Ok(Ok(stream)) => Arc::from(stream),
+    let stream = match connected {
+        Ok(Ok(stream)) => OwnedStream::new(Arc::from(stream)),
         Ok(Err(error)) => {
             // Silent if we already lost the slot — the failure of a session
             // nobody is watching is not news.
@@ -513,6 +783,9 @@ async fn drive_recording(
             return;
         }
     };
+    // From here until finalize closes it, the stream is ours to release: the
+    // guard aborts it if this task ends any other way (R1).
+    guard.stream = Some(stream.clone());
 
     // Latest-start-wins (§5.2): if a newer start claimed the slot while we
     // were connecting, this stream must die by our own hand, silently — it
@@ -588,7 +861,7 @@ async fn drive_recording(
     // ---- Finalize ------------------------------------------------------------
     // The stop instant is time zero for every metric (§metrics).
     let finalize_deadline = stopped_at + limits::STT_FINALIZE;
-    let mut finalize = stream.finalize();
+    let mut finalize = stream.stream.finalize();
 
     let transcript = loop {
         tokio::select! {
@@ -643,9 +916,11 @@ async fn drive_recording(
     };
     let stt_finalize_ms = ms_since(stopped_at);
 
-    // The transcript is final: the STT stream's job is done. Dropping the
-    // receiver here is what makes a LATE socket close harmless (§5.5) — it can
-    // no longer reach a session whose answer is already streaming.
+    // The transcript is final: the STT stream's job is done and finalize closed
+    // it normally, so the guard no longer owns an abort. Dropping the receiver
+    // here is what makes a LATE socket close harmless (§5.5) — it can no
+    // longer reach a session whose answer is already streaming.
+    guard.stream = None;
     drop(rx);
 
     let transcript = transcript.trim().to_string();
@@ -692,9 +967,13 @@ async fn run_answer(
 
     let mut answer = llm.stream_answer(&request, sink, cancel.clone());
 
-    let local = llm.kind() == crate::llm::LlmProviderKind::Local;
-    let first_token_deadline = stopped_at + if local { limits::LOCAL_FIRST_TOKEN } else { limits::LLM_FIRST_TOKEN };
-    let total_deadline = stopped_at + if local { limits::LOCAL_TOTAL } else { limits::LLM_TOTAL };
+    // The deadlines belong to the provider (§3): the local model runs on the
+    // CPU and needs minutes where the cloud gets seconds. Asking the provider
+    // beats matching on `kind()` here — a provider added later cannot be
+    // forgotten by this function.
+    let answer_limits = llm.answer_limits();
+    let first_token_deadline = stopped_at + answer_limits.first_token;
+    let total_deadline = stopped_at + answer_limits.total;
     let mut first_token_at: Option<Instant> = None;
     let mut first_armed = true;
 
@@ -750,12 +1029,23 @@ async fn run_answer(
             inner.complete(
                 id,
                 &gate,
-                SessionEvent::LlmDone { session_id: id, transcript, answer, metrics },
+                SessionEvent::LlmDone {
+                    session_id: id,
+                    transcript,
+                    answer: answer.text,
+                    metrics,
+                    stop_reason: answer.stop_reason,
+                },
             );
         }
         // Our own cancellation surfacing back through the provider — the abort
-        // we caused must never be reported as an error (§5.1).
+        // we caused must never be reported as an error (§5.1). A provider that
+        // returns `aborted` on its own leaves the slot owned; the driver guard
+        // settles that case when this task ends.
         Err(error) if error.is_aborted() => {}
+        // The provider's R2 failures (error frame, early end, empty answer)
+        // land here with the streamed text already on screen; `fail` records
+        // it as the outcome's `partial` and the UI marks the entry incomplete.
         Err(error) => inner.fail(id, &gate, error),
     }
 }
@@ -771,7 +1061,8 @@ mod tests {
     use async_trait::async_trait;
 
     use crate::error::AppResult;
-    use crate::llm::{build_system_prompt, AnswerStyle, LlmProviderKind, Profile};
+    use crate::llm::{build_system_prompt, Answer, AnswerStyle, LlmProviderKind, Profile, StopReason};
+    use crate::session::AnswerLimits;
     use crate::stt::SttConnector;
 
     fn ms(n: u64) -> Duration {
@@ -888,14 +1179,20 @@ mod tests {
 
     #[derive(Default)]
     struct StreamHandle {
-        aborted: AtomicBool,
+        /// Counted, not flagged: R1 requires the socket to be torn down
+        /// exactly once however many paths decide it must die.
+        abort_calls: AtomicUsize,
         frames: Mutex<Vec<Vec<i16>>>,
         finalize_calls: AtomicUsize,
     }
 
     impl StreamHandle {
         fn aborted(&self) -> bool {
-            self.aborted.load(Ordering::SeqCst)
+            self.abort_calls() > 0
+        }
+
+        fn abort_calls(&self) -> usize {
+            self.abort_calls.load(Ordering::SeqCst)
         }
 
         fn frames(&self) -> Vec<Vec<i16>> {
@@ -910,6 +1207,9 @@ mod tests {
     struct StreamScript {
         finalize_delay: Duration,
         finalize_result: AppResult<String>,
+        /// Panic inside finalize — the "connector bug" case of the driver
+        /// supervision contract (R1).
+        finalize_panics: bool,
     }
 
     struct ConnectScript {
@@ -928,6 +1228,7 @@ mod tests {
                 result: Ok(StreamScript {
                     finalize_delay: Duration::ZERO,
                     finalize_result: Ok(transcript.to_string()),
+                    finalize_panics: false,
                 }),
                 error_before_return: None,
             }
@@ -953,6 +1254,13 @@ mod tests {
             self.error_before_return = Some(error);
             self
         }
+
+        fn finalize_panics(mut self) -> Self {
+            if let Ok(script) = &mut self.result {
+                script.finalize_panics = true;
+            }
+            self
+        }
     }
 
     struct FakeSttStream {
@@ -971,11 +1279,14 @@ mod tests {
             if self.script.finalize_delay > Duration::ZERO {
                 tokio::time::sleep(self.script.finalize_delay).await;
             }
+            if self.script.finalize_panics {
+                panic!("scripted STT finalize panic (R1 supervision test)");
+            }
             self.script.finalize_result.clone()
         }
 
         fn abort(&self) {
-            self.handle.aborted.store(true, Ordering::SeqCst);
+            self.handle.abort_calls.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -1044,6 +1355,16 @@ mod tests {
         /// parks on the cancel token — models a socket task that outlives the
         /// pipeline's interest, for the suppression tests (§5.9).
         DetachedDeltas(Vec<(Duration, &'static str)>),
+        /// Stream the deltas, then resolve Ok with this stop reason (R2).
+        StreamStopped(Vec<(Duration, &'static str)>, StopReason),
+        /// Stream the deltas, then fail — the "error frame / early end after
+        /// partial output" shape every provider now reports (R2).
+        StreamThenFail(Vec<(Duration, &'static str)>, AppError),
+        /// Stream the deltas, then panic (R1 driver supervision).
+        StreamThenPanic(Vec<(Duration, &'static str)>),
+        /// Return `aborted` although nobody cancelled — a misbehaving provider
+        /// that would otherwise leave the slot owned forever.
+        SpuriousAbort,
     }
 
     #[derive(Default)]
@@ -1051,11 +1372,18 @@ mod tests {
         scripts: Mutex<VecDeque<LlmScript>>,
         prewarms: AtomicUsize,
         calls: Mutex<Vec<String>>,
+        /// `None` = the trait default (cloud pacing), exactly like a provider
+        /// that never overrides `answer_limits`.
+        limits: Mutex<Option<AnswerLimits>>,
     }
 
     impl FakeLlm {
         fn push(&self, script: LlmScript) {
             self.scripts.lock().unwrap().push_back(script);
+        }
+
+        fn use_limits(&self, limits: AnswerLimits) {
+            *self.limits.lock().unwrap() = Some(limits);
         }
 
         fn prewarms(&self) -> usize {
@@ -1074,7 +1402,7 @@ mod tests {
             req: &AnswerRequest,
             sink: Arc<dyn LlmSink>,
             cancel: CancellationToken,
-        ) -> AppResult<String> {
+        ) -> AppResult<Answer> {
             self.calls.lock().unwrap().push(req.transcript.clone());
             let script = self
                 .scripts
@@ -1082,21 +1410,41 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .unwrap_or(LlmScript::Stream(vec![(Duration::ZERO, "ok")]));
-            match script {
-                LlmScript::Stream(deltas) => {
-                    let mut full = String::new();
-                    for (delay, delta) in deltas {
-                        if delay > Duration::ZERO {
-                            tokio::select! {
-                                _ = cancel.cancelled() => return Err(AppError::aborted()),
-                                _ = tokio::time::sleep(delay) => {}
-                            }
+            // Cancel-aware delta pump shared by the streaming scripts.
+            async fn pump(
+                deltas: Vec<(Duration, &'static str)>,
+                sink: &Arc<dyn LlmSink>,
+                cancel: &CancellationToken,
+            ) -> AppResult<String> {
+                let mut full = String::new();
+                for (delay, delta) in deltas {
+                    if delay > Duration::ZERO {
+                        tokio::select! {
+                            _ = cancel.cancelled() => return Err(AppError::aborted()),
+                            _ = tokio::time::sleep(delay) => {}
                         }
-                        sink.on_delta(delta.to_string());
-                        full.push_str(delta);
                     }
-                    Ok(full)
+                    sink.on_delta(delta.to_string());
+                    full.push_str(delta);
                 }
+                Ok(full)
+            }
+            let complete = |text: String| Answer { text, stop_reason: StopReason::Complete };
+            match script {
+                LlmScript::Stream(deltas) => pump(deltas, &sink, &cancel).await.map(complete),
+                LlmScript::StreamStopped(deltas, stop_reason) => {
+                    let text = pump(deltas, &sink, &cancel).await?;
+                    Ok(Answer { text, stop_reason })
+                }
+                LlmScript::StreamThenFail(deltas, error) => {
+                    pump(deltas, &sink, &cancel).await?;
+                    Err(error)
+                }
+                LlmScript::StreamThenPanic(deltas) => {
+                    pump(deltas, &sink, &cancel).await?;
+                    panic!("scripted provider panic (R1 supervision test)");
+                }
+                LlmScript::SpuriousAbort => Err(AppError::aborted()),
                 LlmScript::Full(delay, answer) => {
                     if delay > Duration::ZERO {
                         tokio::select! {
@@ -1104,7 +1452,7 @@ mod tests {
                             _ = tokio::time::sleep(delay) => {}
                         }
                     }
-                    Ok(answer.to_string())
+                    Ok(complete(answer.to_string()))
                 }
                 LlmScript::Fail(delay, error) => {
                     if delay > Duration::ZERO {
@@ -1131,6 +1479,10 @@ mod tests {
 
         fn kind(&self) -> LlmProviderKind {
             LlmProviderKind::Anthropic
+        }
+
+        fn answer_limits(&self) -> AnswerLimits {
+            self.limits.lock().unwrap().unwrap_or(AnswerLimits::CLOUD)
         }
     }
 
@@ -1955,6 +2307,88 @@ mod tests {
         assert_eq!(h.events.errors_for(a).len(), 1, "no second error from the teardown");
     }
 
+    // ---- provider-owned deadlines --------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn local_limits_keep_a_slow_first_token_alive_past_the_cloud_cap() {
+        // WHY: the local model can spend a minute ingesting the prompt on the
+        // CPU; on the cloud deadlines every local answer died at 10 s with
+        // "did not start answering in time".
+        let h = Harness::new();
+        h.llm.use_limits(AnswerLimits::LOCAL);
+        h.llm.push(LlmScript::Stream(vec![(secs(60), "slow start")]));
+
+        let id = h.ask("Q").await.expect("valid ask");
+        settle().await;
+
+        advance(limits::LLM_FIRST_TOKEN).await;
+        assert!(h.events.errors_for(id).is_empty(), "the 10 s cloud cap must not apply");
+
+        advance(secs(50)).await; // the delta lands at 60 s, inside the 90 s local cap
+        let (_, answer, metrics) = h.events.done_for(id).expect("answer lands at 60 s");
+        assert_eq!(answer, "slow start");
+        assert_eq!(metrics.first_token_ms, 60_000);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn local_limits_still_cap_the_first_token_at_ninety_seconds() {
+        // WHY: "longer" is not "forever" — a wedged Ollama must still surface
+        // as a structured timeout on the local number, not hang the UI, and
+        // late deltas stay suppressed exactly as on the cloud path.
+        let h = Harness::new();
+        h.llm.use_limits(AnswerLimits::LOCAL);
+        h.llm.push(LlmScript::DetachedDeltas(vec![(secs(100), "too late")]));
+
+        let id = h.ask("Q").await.expect("valid ask");
+        settle().await;
+
+        advance(secs(89)).await;
+        assert!(h.events.errors_for(id).is_empty(), "still inside the local cap");
+        advance(secs(1)).await;
+        assert_eq!(h.events.error_codes(id), vec![ErrorCode::LlmFirstTokenTimeout]);
+
+        advance(secs(10)).await; // the detached task pushes its delta now
+        assert!(h.events.deltas_for(id).is_empty(), "nothing may paint after the error");
+        assert_eq!(h.events.errors_for(id).len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn local_limits_extend_the_total_deadline_to_five_minutes() {
+        // WHY: a CPU stream trickles; cutting it at the cloud's 60 s truncated
+        // real local answers mid-sentence.
+        let h = Harness::new();
+        h.llm.use_limits(AnswerLimits::LOCAL);
+        h.llm.push(LlmScript::Stream(vec![(secs(1), "started"), (secs(200), " and finished")]));
+
+        let id = h.ask("Q").await.expect("valid ask");
+        settle().await;
+
+        advance(secs(1)).await;
+        assert_eq!(h.events.deltas_for(id), vec!["started".to_string()]);
+        advance(limits::LLM_TOTAL).await; // 61 s: past the cloud total cap
+        assert!(h.events.errors_for(id).is_empty(), "the 60 s cloud total must not apply");
+
+        advance(secs(140)).await; // 201 s: inside the 300 s local total
+        let (_, answer, metrics) = h.events.done_for(id).expect("done inside the local total");
+        assert_eq!(answer, "started and finished");
+        assert_eq!(metrics.total_ms, 201_000);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cloud_limits_stay_the_default_when_a_provider_says_nothing() {
+        // WHY: the fake never called `use_limits`, exactly like a provider
+        // that does not override the method — it must get the 10 s cap, not
+        // silently inherit the local one.
+        let h = Harness::new();
+        h.llm.push(LlmScript::DetachedDeltas(vec![(secs(20), "too late")]));
+
+        let id = h.ask("Q").await.expect("valid ask");
+        settle().await;
+
+        advance(limits::LLM_FIRST_TOKEN).await;
+        assert_eq!(h.events.error_codes(id), vec![ErrorCode::LlmFirstTokenTimeout]);
+    }
+
     // ---- metrics & prewarm --------------------------------------------------
 
     #[tokio::test(start_paused = true)]
@@ -1998,10 +2432,12 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn prewarm_fires_on_start_stop_and_ask() {
+    async fn prewarm_fires_on_start_and_stop_not_ask() {
         // WHY: the stop-time prewarm overlapping the STT flush is what buys
-        // the ~1 s stop-to-first-word; dropping any of the three shows up as
-        // a cold TLS handshake on the critical path.
+        // the ~1 s stop-to-first-word; dropping either of the two shows up as
+        // a cold TLS handshake on the critical path. Ask is different (RS-1):
+        // its answer request fires microseconds after submission, so a warm
+        // there has nothing to overlap and only races the real request.
         let h = Harness::new();
         h.stt.push(ConnectScript::ok("q").finalize_delay(ms(100)));
 
@@ -2016,7 +2452,8 @@ mod tests {
         assert!(h.events.done_for(id).is_some());
 
         h.ask("typed question").await.expect("valid ask");
-        assert_eq!(h.llm.prewarms(), 3, "prewarm on ask");
+        settle().await;
+        assert_eq!(h.llm.prewarms(), 2, "no prewarm on ask: nothing for it to overlap");
     }
 
     #[tokio::test(start_paused = true)]
@@ -2037,5 +2474,279 @@ mod tests {
         let id2 = h.ask("Again").await.expect("valid ask");
         settle().await;
         assert!(h.events.done_for(id2).is_some());
+    }
+
+    // ---- R1: recorded outcomes ------------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn an_immediate_connect_failure_is_recorded_before_anyone_adopts_the_id() {
+        // WHY (R1): the shell used to return Ok(id) for a session that had
+        // already failed while the device was opening, and the UI — which
+        // had not adopted the id yet — dropped the only error event. The
+        // outcome must be readable after the fact, consistent with is_active.
+        let h = Harness::new();
+        h.stt.push(ConnectScript::fail(AppError::new(ErrorCode::SttConnect, "down")));
+        let id = h.start().await;
+        settle().await;
+        assert!(!h.manager.is_active(id));
+        match h.manager.outcome(id) {
+            SessionOutcome::Failed { error, transcript, partial } => {
+                assert_eq!(error.code, ErrorCode::SttConnect);
+                assert_eq!((transcript.as_str(), partial.as_str()), ("", ""));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert_eq!(h.events.error_codes(id), vec![ErrorCode::SttConnect], "still exactly one event");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_instant_answer_is_recorded_as_completed_never_as_an_error() {
+        // WHY (R1 refinement): a stored ERROR alone cannot recover an early
+        // SUCCESS; an answer that finished before adoption must come back
+        // with its transcript, text and metrics.
+        let h = Harness::new();
+        h.llm.push(LlmScript::Full(Duration::ZERO, "Forty-two."));
+        let id = h.ask("What is the answer?").await.unwrap();
+        settle().await;
+        assert!(!h.manager.is_active(id));
+        let (transcript, answer, metrics) = h.events.done_for(id).expect("done emitted");
+        assert_eq!(
+            h.manager.outcome(id),
+            SessionOutcome::Completed { transcript, answer, metrics, stop_reason: StopReason::Complete }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_answer_records_exactly_the_text_the_ui_was_shown() {
+        // WHY (R1/R2): an interrupted answer stays on screen marked
+        // incomplete; an adoption that missed the stream must be able to
+        // recover the same partial text, not an empty one.
+        let h = Harness::new();
+        h.llm.push(LlmScript::StreamThenFail(
+            vec![(Duration::ZERO, "Half "), (Duration::ZERO, "an answer")],
+            AppError::new(ErrorCode::LlmHttp, "ended early"),
+        ));
+        let id = h.ask("Question?").await.unwrap();
+        settle().await;
+        assert_eq!(h.events.deltas_for(id).concat(), "Half an answer");
+        assert_eq!(
+            h.manager.outcome(id),
+            SessionOutcome::Failed {
+                error: AppError::new(ErrorCode::LlmHttp, "ended early"),
+                transcript: "Question?".into(),
+                partial: "Half an answer".into(),
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn superseded_and_cancelled_sessions_are_recorded_as_cancelled_and_stay_silent() {
+        // WHY: an older lookup must never settle a newer session, and a
+        // superseded session must read as cancelled (silent), not failed.
+        // Also R1's "released exactly once": teardown AND the driver's own
+        // cancel arm both decide to abort the old stream, and it dies once.
+        let h = Harness::new();
+        let a = h.start().await;
+        settle().await;
+        let b = h.start().await;
+        settle().await;
+        assert_eq!(h.manager.outcome(a), SessionOutcome::Cancelled);
+        assert_eq!(h.manager.outcome(b), SessionOutcome::Active);
+        assert_eq!(h.stt.stream(0).abort_calls(), 1, "the superseded stream is aborted exactly once");
+        h.manager.cancel(b);
+        settle().await;
+        assert_eq!(h.manager.outcome(b), SessionOutcome::Cancelled);
+        assert_eq!(h.stt.stream(1).abort_calls(), 1);
+        assert!(h.events.errors_for(a).is_empty() && h.events.errors_for(b).is_empty());
+        assert_eq!(h.manager.outcome(999), SessionOutcome::Unknown, "never issued");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn outcomes_are_kept_per_id_and_retired_oldest_first() {
+        // WHY: a single global "last outcome" could be overwritten by a
+        // newer session before the older adoption read it; the log is keyed
+        // by id and bounded so a long call cannot grow it without limit.
+        let h = Harness::new();
+        let mut ids = Vec::new();
+        for _ in 0..=OUTCOME_RETENTION {
+            h.llm.push(LlmScript::Full(Duration::ZERO, "a"));
+            ids.push(h.ask("q").await.unwrap());
+            settle().await;
+        }
+        assert_eq!(h.manager.outcome(ids[0]), SessionOutcome::Unknown, "oldest retired");
+        for id in &ids[1..] {
+            assert!(
+                matches!(h.manager.outcome(*id), SessionOutcome::Completed { .. }),
+                "id {id} must still be known"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_terminal_outcome_is_never_rewritten_by_a_later_path() {
+        // WHY: settle-once. A late device error, cancel or guard drop for an
+        // already-completed id must not turn a delivered answer into a
+        // failure the next lookup would report.
+        let h = Harness::new();
+        let id = h.start().await;
+        settle().await;
+        assert_eq!(h.manager.stop(id).await, StopOutcome::Taken);
+        settle().await;
+        let done = h.manager.outcome(id);
+        assert!(matches!(done, SessionOutcome::Completed { .. }));
+        h.manager.device_error(id, AppError::internal("late"));
+        h.manager.cancel(id);
+        settle().await;
+        assert_eq!(h.manager.outcome(id), done);
+        assert!(h.events.errors_for(id).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn token_limit_stop_reaches_done_and_the_recorded_outcome() {
+        // WHY (R2): a capped answer is completed-but-cut-short; the reason
+        // must survive to the UI on both the live and the lookup path.
+        let h = Harness::new();
+        h.llm.push(LlmScript::StreamStopped(vec![(Duration::ZERO, "Long")], StopReason::TokenLimit));
+        let id = h.ask("q").await.unwrap();
+        settle().await;
+        let stop = h.events.for_id(id).into_iter().find_map(|e| match e {
+            SessionEvent::LlmDone { stop_reason, .. } => Some(stop_reason),
+            _ => None,
+        });
+        assert_eq!(stop, Some(StopReason::TokenLimit));
+        assert!(matches!(
+            h.manager.outcome(id),
+            SessionOutcome::Completed { stop_reason: StopReason::TokenLimit, .. }
+        ));
+    }
+
+    // ---- R1: driver supervision -----------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn a_panicking_provider_settles_the_session_once_and_frees_the_slot() {
+        // WHY (R1): a panic unwinding out of a provider used to leave Active
+        // in the slot — the UI waited on a session nobody was driving. The
+        // guard must turn it into exactly one internal error, keep the text
+        // already shown, and leave the next Record free to start.
+        let h = Harness::new();
+        h.llm.push(LlmScript::StreamThenPanic(vec![(Duration::ZERO, "Hal")]));
+        let id = h.start().await;
+        settle().await;
+        assert_eq!(h.manager.stop(id).await, StopOutcome::Taken);
+        settle().await;
+        let errors = h.events.errors_for(id);
+        assert_eq!(errors.len(), 1, "exactly one terminal event");
+        assert_eq!(errors[0], AppError::internal(MSG_DRIVER_STOPPED));
+        assert!(!h.manager.is_active(id));
+        assert!(matches!(
+            h.manager.outcome(id),
+            SessionOutcome::Failed { ref partial, .. } if partial == "Hal"
+        ));
+        // Finalize had already closed the STT stream normally: nothing left
+        // for the guard to abort, so it must not abort a second time.
+        assert_eq!(h.stt.stream(0).abort_calls(), 0);
+        // The next session starts normally.
+        let next = h.start().await;
+        settle().await;
+        assert!(h.manager.is_active(next));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_panic_while_the_stream_is_open_aborts_it_exactly_once() {
+        // WHY (R1): the guard owns the live STT socket until finalize closes
+        // it; a connector that panics mid-finalize must still have its
+        // socket torn down — once — and the session must still settle.
+        let h = Harness::new();
+        h.stt.push(ConnectScript::ok("q").finalize_panics());
+        let id = h.start().await;
+        settle().await;
+        assert_eq!(h.manager.stop(id).await, StopOutcome::Taken);
+        settle().await;
+        assert_eq!(h.stt.stream(0).abort_calls(), 1);
+        assert_eq!(h.events.error_codes(id), vec![ErrorCode::Internal]);
+        assert!(!h.manager.is_active(id));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_provider_returning_aborted_on_its_own_cannot_hang_the_session() {
+        // WHY: `aborted` is silent by contract because it normally means WE
+        // cancelled. A provider that returns it spontaneously used to exit
+        // the driver with the slot still owned — a silent hang the guard now
+        // settles as an internal error.
+        let h = Harness::new();
+        h.llm.push(LlmScript::SpuriousAbort);
+        let id = h.ask("q").await.unwrap();
+        settle().await;
+        assert_eq!(h.events.errors_for(id), vec![AppError::internal(MSG_DRIVER_STOPPED)]);
+        assert!(!h.manager.is_active(id));
+    }
+
+    // ---- R1 review F1: a sink that panics ------------------------------------
+
+    /// Panics on the first `LlmDelta` (or on every emit when `always`), then
+    /// records like `RecordingSink`. Models a panic raised inside the sink.
+    struct PanickingSink {
+        inner: RecordingSink,
+        fired: AtomicBool,
+        always: bool,
+    }
+
+    impl EventSink for PanickingSink {
+        fn emit(&self, e: SessionEvent) {
+            let trigger = self.always
+                || (matches!(e, SessionEvent::LlmDelta { .. }) && !self.fired.swap(true, Ordering::SeqCst));
+            if trigger && !matches!(e, SessionEvent::SessionError { .. }) {
+                panic!("scripted sink panic (R1 review F1)");
+            }
+            if self.always {
+                panic!("scripted sink panic on the error emit too");
+            }
+            self.inner.emit(e);
+        }
+    }
+
+    fn deps_with_sink(h: &Harness, sink: Arc<PanickingSink>) -> SessionDeps {
+        SessionDeps { events: sink, ..h.deps() }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_sink_panic_mid_answer_settles_the_session_without_aborting_the_process() {
+        // WHY (review F1): the guard runs mid-unwind; emitting inline through
+        // a sink that panics again would be a panic in a destructor during
+        // unwinding — a process abort. The emit is deferred to a fresh task,
+        // so the error still arrives and the outcome is recorded.
+        let h = Harness::new();
+        let sink = Arc::new(PanickingSink {
+            inner: RecordingSink::default(),
+            fired: AtomicBool::new(false),
+            always: false,
+        });
+        h.llm.push(LlmScript::Stream(vec![(Duration::ZERO, "lost"), (Duration::ZERO, " tail")]));
+        let id = h.manager.ask("q", deps_with_sink(&h, sink.clone())).await.unwrap();
+        settle().await;
+        assert_eq!(sink.inner.errors_for(id), vec![AppError::internal(MSG_DRIVER_STOPPED)]);
+        assert!(!h.manager.is_active(id));
+        // The delta whose emit panicked never reached the UI, so it is not
+        // part of the recorded partial either.
+        assert!(matches!(
+            h.manager.outcome(id),
+            SessionOutcome::Failed { ref partial, .. } if partial.is_empty()
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_sink_that_panics_on_every_emit_cannot_abort_the_process() {
+        // WHY (review F1): with the old inline emit this variant aborted the
+        // whole test binary. Reaching the assertions IS the test.
+        let h = Harness::new();
+        let sink = Arc::new(PanickingSink {
+            inner: RecordingSink::default(),
+            fired: AtomicBool::new(false),
+            always: true,
+        });
+        let id = h.manager.ask("q", deps_with_sink(&h, sink)).await.unwrap();
+        settle().await;
+        assert!(!h.manager.is_active(id));
+        assert!(matches!(h.manager.outcome(id), SessionOutcome::Failed { .. }));
     }
 }

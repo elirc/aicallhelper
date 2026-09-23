@@ -19,6 +19,7 @@ const TITLES: Record<ErrorCode, string> = {
   llm_timeout: 'The model timed out',
   aborted: '', // never rendered — see below
   internal: 'Something went wrong',
+  settings_conflict: 'Settings changed elsewhere',
 };
 
 export function ErrorBox({ error }: { error: AppError | null }) {

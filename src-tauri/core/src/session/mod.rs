@@ -9,9 +9,10 @@ pub mod machine;
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::error::AppError;
-use crate::llm::{AnswerRequest, LlmProvider};
+use crate::llm::{AnswerRequest, LlmProvider, StopReason};
 use crate::stt::SttConnector;
 
 /// Identifies one question/answer pipeline. Every event carries it so the
@@ -66,6 +67,9 @@ pub enum SessionEvent {
         transcript: String,
         answer: String,
         metrics: Metrics,
+        /// Why generation stopped (R2) — `token_limit` is shown as "cut
+        /// short". Separate from `metrics` on purpose: timing is not outcome.
+        stop_reason: StopReason,
     },
     #[serde(rename_all = "camelCase")]
     SessionError { session_id: SessionId, error: AppError },
@@ -96,6 +100,62 @@ impl SessionEvent {
         }
     }
 }
+
+/// How a session ended — or that it has not yet (R1, ADR 015).
+///
+/// Recorded by the core per session id at the same instant the slot is
+/// released, so "no longer active" and "has a terminal outcome" can never be
+/// observed apart. `start_session`/`ask` return it next to the id, and the
+/// frontend looks it up once on adoption (`session_outcome`), so an early
+/// terminal event it could not match yet is never the only record of how the
+/// session ended.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum SessionOutcome {
+    /// Still running; events will follow.
+    Active,
+    /// `llm:done` was (or is being) emitted with exactly these fields.
+    #[serde(rename_all = "camelCase")]
+    Completed {
+        transcript: String,
+        answer: String,
+        metrics: Metrics,
+        stop_reason: StopReason,
+    },
+    /// `session:error` was emitted. `transcript` and `partial` are what the UI
+    /// had been shown when it failed, so an adoption that missed the stream
+    /// still keeps the right text, marked incomplete.
+    #[serde(rename_all = "camelCase")]
+    Failed { error: AppError, transcript: String, partial: String },
+    /// Cancelled or superseded: silent by contract (§5.1, §5.10).
+    Cancelled,
+    /// Never started, or retired from the bounded log (`OUTCOME_RETENTION`).
+    Unknown,
+}
+
+impl SessionOutcome {
+    pub fn is_terminal(&self) -> bool {
+        !matches!(self, SessionOutcome::Active | SessionOutcome::Unknown)
+    }
+}
+
+/// What `start_session` and `ask` resolve with: the new id AND its outcome as
+/// of the moment the command answered. A session that already ended (an
+/// immediate connect failure, a local oversize rejection, an instant answer)
+/// reports that here instead of a bare id the UI would wait on forever.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionStart {
+    pub session_id: SessionId,
+    pub outcome: SessionOutcome,
+}
+
+/// How many sessions' outcomes the core keeps, newest first. An outcome is
+/// retired only when this many NEWER sessions have been claimed. The frontend
+/// asks only about the attempt it is adopting, and runs one attempt at a time,
+/// so a retirement can never hit a pending adoption; the bound exists so a
+/// long call does not grow the log without limit.
+pub const OUTCOME_RETENTION: usize = 16;
 
 /// Where session events go. The Tauri shell implements this by emitting to the
 /// webview; tests implement it by pushing into a Vec.
@@ -148,6 +208,32 @@ pub mod limits {
     pub const MAX_ASK_CHARS: usize = 8000;
 }
 
+/// The two answer-stage deadlines the state machine arms once the transcript
+/// is final, both counted from the stop instant (§3).
+///
+/// A provider carries its own pair (`LlmProvider::answer_limits`) instead of
+/// the machine matching on `kind()`: the local model runs on the CPU and
+/// legitimately needs minutes where a cloud model gets seconds, and keying
+/// that off the kind meant the machine had to know every provider's pacing —
+/// a provider added without the matching arm silently inherited the 10 s
+/// cloud cap and timed out on every answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnswerLimits {
+    /// Stop -> first answer token.
+    pub first_token: Duration,
+    /// Stop -> answer complete.
+    pub total: Duration,
+}
+
+impl AnswerLimits {
+    /// Cloud providers (§3): 10 s to the first token, 60 s in total.
+    pub const CLOUD: Self =
+        Self { first_token: limits::LLM_FIRST_TOKEN, total: limits::LLM_TOTAL };
+    /// Free local mode: CPU inference, 90 s to the first token, 300 s in total.
+    pub const LOCAL: Self =
+        Self { first_token: limits::LOCAL_FIRST_TOKEN, total: limits::LOCAL_TOTAL };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,6 +273,7 @@ mod tests {
                     transcript: "t".into(),
                     answer: "a".into(),
                     metrics: Metrics::finish(1, Some(2), 3),
+                    stop_reason: StopReason::Complete,
                 },
                 "llm:done",
             ),
@@ -205,5 +292,62 @@ mod tests {
         assert!(json.contains("sttFinalizeMs"), "got {json}");
         assert!(json.contains("firstTokenMs"), "got {json}");
         assert!(json.contains("totalMs"), "got {json}");
+    }
+
+    #[test]
+    fn session_outcomes_have_the_wire_shapes_the_frontend_switches_on() {
+        // `src/types.ts` mirrors these by hand; a renamed tag or field would
+        // make every adoption-time reconciliation fall through to "unknown".
+        use serde_json::json;
+        let start = SessionStart { session_id: 3, outcome: SessionOutcome::Active };
+        assert_eq!(
+            serde_json::to_value(&start).unwrap(),
+            json!({ "sessionId": 3, "outcome": { "status": "active" } })
+        );
+        let done = SessionOutcome::Completed {
+            transcript: "q".into(),
+            answer: "a".into(),
+            metrics: Metrics::finish(0, Some(2), 3),
+            stop_reason: StopReason::TokenLimit,
+        };
+        assert_eq!(
+            serde_json::to_value(&done).unwrap(),
+            json!({
+                "status": "completed", "transcript": "q", "answer": "a",
+                "metrics": { "sttFinalizeMs": 0, "firstTokenMs": 2, "totalMs": 3 },
+                "stopReason": "token_limit"
+            })
+        );
+        let failed = SessionOutcome::Failed {
+            error: AppError::internal("x"),
+            transcript: "q".into(),
+            partial: "half".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&failed).unwrap(),
+            json!({
+                "status": "failed", "error": { "code": "internal", "message": "x" },
+                "transcript": "q", "partial": "half"
+            })
+        );
+        assert_eq!(serde_json::to_value(SessionOutcome::Cancelled).unwrap(), json!({ "status": "cancelled" }));
+        assert_eq!(serde_json::to_value(SessionOutcome::Unknown).unwrap(), json!({ "status": "unknown" }));
+        assert!(done.is_terminal() && failed.is_terminal() && SessionOutcome::Cancelled.is_terminal());
+        assert!(!SessionOutcome::Active.is_terminal() && !SessionOutcome::Unknown.is_terminal());
+    }
+
+    #[test]
+    fn answer_limits_presets_mirror_the_pinned_constants() {
+        // The presets are the only route the deadlines take into the machine;
+        // if one drifts from `limits::*` the numbers SPEC §3 promises and the
+        // numbers actually enforced diverge without any test noticing.
+        assert_eq!(AnswerLimits::CLOUD.first_token, limits::LLM_FIRST_TOKEN);
+        assert_eq!(AnswerLimits::CLOUD.total, limits::LLM_TOTAL);
+        assert_eq!(AnswerLimits::LOCAL.first_token, limits::LOCAL_FIRST_TOKEN);
+        assert_eq!(AnswerLimits::LOCAL.total, limits::LOCAL_TOTAL);
+        // Local is the slow path by construction: a "longer" pair that is
+        // shorter than the cloud pair would be a copy-paste error.
+        assert!(AnswerLimits::LOCAL.first_token > AnswerLimits::CLOUD.first_token);
+        assert!(AnswerLimits::LOCAL.total > AnswerLimits::CLOUD.total);
     }
 }

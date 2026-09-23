@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use app_core::audio::{AudioHandle, AudioSink};
 use app_core::session::machine::SessionManager;
 use app_core::session::SessionId;
-use app_core::store::SettingsStore;
+use app_core::store::{EffectReconciler, SettingsStore};
 use app_core::AppError;
 
 use crate::hotkey::HotkeyState;
@@ -17,6 +17,9 @@ pub struct AppState {
     /// The one live loopback capture, tagged with the session it feeds.
     pub audio: Mutex<Option<ActiveCapture>>,
     pub hotkey: Mutex<HotkeyState>,
+    /// Serializes and reconciles the OS side of settings: hotkey, window
+    /// flag, dock (R5, ADR 016). Runs after every committed save.
+    pub effects: EffectReconciler,
     pub bounds_saver: Arc<DebouncedSaver>,
     pub reload_limiter: Mutex<ReloadLimiter>,
 }

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
-import { checkLocalVoice, prepareLocalVoice } from '../bridge';
+import { getBridge } from '../bridge';
 import type { LocalVoiceStatus } from '../types';
+import './LocalVoicePanel.css';
 
 export function LocalVoicePanel() {
   const [status, setStatus] = useState<LocalVoiceStatus | null>(null);
@@ -15,7 +16,8 @@ export function LocalVoicePanel() {
     setBusy(warm ? 'warm' : 'check');
     setMessage('');
     try {
-      const result = await (warm ? prepareLocalVoice() : checkLocalVoice());
+      const bridge = getBridge();
+      const result = await (warm ? bridge.prepareLocalVoice() : bridge.localVoiceStatus());
       if (!mounted.current) return;
       if (result.ok) {
         setStatus(result.value);

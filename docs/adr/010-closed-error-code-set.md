@@ -19,10 +19,13 @@ the default behavior.
 
 ## Decision
 
-- One closed enum, thirteen codes, defined in exactly one place
-  (`error.rs:11-27`): `no_stt_key · no_llm_key · stt_connect · stt_error ·
+- One closed enum, fourteen codes, defined in exactly one place
+  (`core/src/error.rs`): `no_stt_key · no_llm_key · stt_connect · stt_error ·
   stt_timeout · no_speech · llm_auth · llm_http · llm_rate_limit ·
-  llm_first_token_timeout · llm_timeout · aborted · internal` (SPEC §4).
+  llm_first_token_timeout · llm_timeout · aborted · internal ·
+  settings_conflict` (SPEC §4). The fourteenth, `settings_conflict`, was
+  added in 2026-09 (ADR 016) because the UI must act on it differently from
+  a failed save: keep the draft and offer a reload.
 - The **wire strings are pinned by test on both sides**
   (`error.rs:111-120`; the frontend switches on the same literals), so a
   rename cannot silently change behavior across the IPC boundary.

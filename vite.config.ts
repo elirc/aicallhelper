@@ -13,8 +13,19 @@ export default defineConfig({
     strictPort: true,
   },
   build: {
-    // WebView2 on Windows 10/11 is evergreen Chromium; no legacy target needed.
-    target: 'chrome105',
+    // WebView2 on Windows 10/11 is evergreen Chromium (120+ since late 2023);
+    // a lower target only adds syntax transforms the runtime never needs (FE-6).
+    target: 'chrome120',
+    // The polyfill exists for browsers without <link rel="modulepreload">;
+    // Chromium has had it for years, so it is dead bytes parsed on every
+    // launch (FE-7).
+    modulePreload: { polyfill: false },
+    // Lazy views must stay separate chunks WITH their own CSS, so opening the
+    // app never parses the Settings or Interview-prep styles.
+    cssCodeSplit: true,
+    // Compressed-size reporting gzips every chunk twice for a number nobody
+    // reads: Tauri ships the files from disk, not over HTTP.
+    reportCompressedSize: false,
     sourcemap: false,
   },
   test: {

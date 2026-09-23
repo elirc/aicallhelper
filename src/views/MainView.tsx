@@ -1,19 +1,19 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { RefObject } from 'react';
-import type { AnswerStyle, Envelope, SettingsView as Settings } from '../types';
+import { hasRequiredKeys } from '../types';
+import type { AnswerStyle, Envelope, HotkeyStatus, SettingsView as Settings } from '../types';
 import type { SessionApi } from '../state/useSession';
 import { formatDuration, formatHotkey } from '../format';
-import type { HotkeyStatus } from '../components/hotkey';
 import { RecordButton } from '../components/RecordButton';
 import { StatusLine } from '../components/StatusLine';
 import { LevelMeter } from '../components/LevelMeter';
 import { AskForm } from '../components/AskForm';
 import { StyleChips } from '../components/StyleChips';
+import { ProfileChips } from '../components/ProfileChips';
 import { TranscriptPanel } from '../components/TranscriptPanel';
 import { AnswerPanel } from '../components/AnswerPanel';
 import { ErrorBox } from '../components/ErrorBox';
-import { HistoryBar } from '../components/HistoryBar';
-import '../components/LocalVoicePanel.css';
+import { useAnnouncer } from '../components/useTransient';
 
 interface MainViewProps {
   session: SessionApi;
@@ -24,29 +24,51 @@ interface MainViewProps {
   onPrepareSettings?(): void;
   /** Persists the style; the caller updates `settings` from the save's response. */
   onSelectStyle(style: AnswerStyle): Promise<Envelope<Settings>>;
+  /** Persists ONLY the active id (§8); the caller updates `settings` from the response. */
+  onSelectProfile(id: string): Promise<Envelope<Settings>>;
+  /** Moves the window under the webcam; a refusal is surfaced by the caller. */
+  onDock(): Promise<void> | void;
+  /** Answer-only posture: rows the eyes don't need mid-call are hidden. */
+  focusMode: boolean;
+  onToggleFocus(): void;
+  /**
+   * Typed Ask. App passes a wrapper that checks the free-local byte budget
+   * first (R4); without one, the question goes straight to the session.
+   */
+  onAsk?(text: string): Promise<boolean>;
   /** Owned by App so it can restore focus here when Settings closes. */
   gearRef: RefObject<HTMLButtonElement>;
 }
 
-/**
- * How long an announcement stays in the live region before it is wiped. The
- * wipe is what makes REPEATED announcements audible: setting an identical
- * string twice is a state update React bails out of, so no DOM mutation
- * reaches the screen reader the second time.
- */
-const ANNOUNCEMENT_CLEAR_MS = 1500;
+/** The in-window focus toggle is a plain keydown, NOT a global shortcut (§9). */
+function isFocusShortcut(e: KeyboardEvent): boolean {
+  return e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey && (e.code === 'KeyF' || e.key.toLowerCase() === 'f');
+}
 
-export function MainView({ session, settings, hotkey, onOpenSettings, onPrepareSettings, onSelectStyle, gearRef }: MainViewProps) {
+function isEditable(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  const tag = target.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable === true;
+}
+
+export function MainView({
+  session,
+  settings,
+  hotkey,
+  onOpenSettings,
+  onPrepareSettings,
+  onSelectStyle,
+  onSelectProfile,
+  onDock,
+  focusMode,
+  onToggleFocus,
+  onAsk,
+  gearRef,
+}: MainViewProps) {
   const recordRef = useRef<HTMLButtonElement>(null);
-  const [announcement, setAnnouncement] = useState('');
-  const announcementTimerRef = useRef<number | null>(null);
-
-  useEffect(
-    () => () => {
-      if (announcementTimerRef.current != null) window.clearTimeout(announcementTimerRef.current);
-    },
-    []
-  );
+  // Wiped after a beat so a REPEATED announcement is a real DOM change the
+  // screen reader hears (see useAnnouncer).
+  const [announcement, announce] = useAnnouncer();
 
   // "Done" is a transition, not a state: idle-after-answering with no error.
   // Tracked here because the hook's idle cannot distinguish fresh from done.
@@ -64,7 +86,23 @@ export function MainView({ session, settings, hotkey, onOpenSettings, onPrepareS
     }
   }, [session.state, session.error]);
 
+  // Ctrl+Shift+F toggles focus mode while this window has focus. Read through
+  // a ref so the listener is attached once; skipped inside text fields where
+  // the chord could be a legitimate edit (e.g. a hotkey being typed).
+  const toggleFocusRef = useRef(onToggleFocus);
+  toggleFocusRef.current = onToggleFocus;
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (!isFocusShortcut(e) || isEditable(e.target)) return;
+      e.preventDefault();
+      toggleFocusRef.current();
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
   const recording = session.state === 'recording';
+  const active = session.state === 'starting' || session.state === 'recording' || session.state === 'finalizing';
 
   // The streaming decorations belong to the entry receiving tokens — the
   // newest one — not to an older entry the user may have navigated back to.
@@ -72,42 +110,77 @@ export function MainView({ session, settings, hotkey, onOpenSettings, onPrepareS
   const viewingLive = session.viewed != null && session.viewed.key === lastKey;
   const streaming = session.state === 'answering' && viewingLive;
 
-  // First-run nudge keys off the SELECTED provider: a missing Groq key is not
-  // a problem while the Anthropic preset is chosen.
-  const firstRun =
-    settings != null && settings.llmProvider !== 'local' &&
-    (!settings.hasDeepgramKey ||
-      (settings.llmProvider === 'anthropic' && !settings.hasAnthropicKey) ||
-      (settings.llmProvider === 'groq' && !settings.hasGroqKey));
+  // First-run nudge keys off the SELECTED provider (a missing Groq key is not
+  // a problem while the Anthropic preset is chosen); null until settings
+  // load so the status line renders nothing rather than a wrong first frame.
+  const firstRun = settings == null ? null : !hasRequiredKeys(settings);
+
+  // The core guarantees activeProfileId names an entry; the first-entry
+  // fallback only covers a view assembled by hand (tests) or a stale cache.
+  const activeProfile =
+    settings?.profiles.find((p) => p.id === settings.activeProfileId) ?? settings?.profiles[0] ?? null;
+  const ungrounded =
+    settings != null &&
+    activeProfile != null &&
+    activeProfile.resume.trim() === '' &&
+    activeProfile.jobDescription.trim() === '' &&
+    hasRequiredKeys(settings);
 
   const canRegenerate =
     (session.viewed?.question ?? '') !== '' && (session.state === 'idle' || session.state === 'answering');
 
-  async function selectStyle(style: AnswerStyle) {
-    const env = await onSelectStyle(style);
-    // A silent failure would leave the user believing the chip they clicked;
-    // the unchanged pressed state plus this error tells the real story.
-    if (!env.ok) session.setError(env.error);
-  }
+  const selectStyle = useCallback(
+    async (style: AnswerStyle) => {
+      const env = await onSelectStyle(style);
+      // A silent failure would leave the user believing the chip they clicked;
+      // the unchanged pressed state plus this error tells the real story.
+      if (!env.ok) session.setError(env.error);
+    },
+    [onSelectStyle, session.setError]
+  );
 
-  function clearHistory() {
+  const selectProfile = useCallback(
+    async (id: string) => {
+      const env = await onSelectProfile(id);
+      if (!env.ok) session.setError(env.error);
+    },
+    [onSelectProfile, session.setError]
+  );
+
+  const clearHistory = useCallback(() => {
     session.clearHistory();
-    // §9 pins the "History cleared" announcement. It must be wiped afterwards:
-    // left in place, a second Clear would set the identical string, React
-    // would skip the DOM write, and the screen reader would hear nothing.
-    setAnnouncement('History cleared');
-    if (announcementTimerRef.current != null) window.clearTimeout(announcementTimerRef.current);
-    announcementTimerRef.current = window.setTimeout(() => setAnnouncement(''), ANNOUNCEMENT_CLEAR_MS);
+    // §9 pins the "History cleared" announcement.
+    announce('History cleared');
     // The Clear button unmounts with its bar; without an explicit target,
     // focus falls to <body> and keyboard users lose their place.
     recordRef.current?.focus();
-  }
+  }, [session.clearHistory, announce]);
 
   return (
-    <div className="app main-view">
+    <div className={`app main-view${focusMode ? ' main-view--focus' : ''}`}>
       <header className="app-header">
         <span className={`status-dot status-dot--${session.state}`} aria-hidden="true" />
         <h1 className="app-title">AI Call Assistant</h1>
+        <button
+          type="button"
+          className="icon-button"
+          aria-label="Focus mode"
+          aria-pressed={focusMode}
+          title="Show only the answer (Ctrl+Shift+F)"
+          onClick={onToggleFocus}
+        >
+          <span aria-hidden="true">◎</span>
+        </button>
+        {/* A window operation, not a settings edit: live before settings load. */}
+        <button
+          type="button"
+          className="icon-button"
+          aria-label="Dock to camera"
+          title="Move this window to the top of the screen, under the webcam"
+          onClick={() => void onDock()}
+        >
+          <span aria-hidden="true">⬆</span>
+        </button>
         <button
           ref={gearRef}
           type="button"
@@ -124,13 +197,32 @@ export function MainView({ session, settings, hotkey, onOpenSettings, onPrepareS
         </button>
       </header>
 
-      {settings?.llmProvider === 'local' && (
-        <aside className="local-mode-banner" aria-label="Current mode">
-          <strong>Free local voice · no API fees</strong>
-          <p>English system audio · CPU answers may take longer.</p>
-          <button type="button" className="ghost-button" onClick={onOpenSettings}>Local setup</button>
-        </aside>
-      )}
+      <ProfileChips
+        profiles={settings?.profiles ?? []}
+        activeId={settings?.activeProfileId ?? ''}
+        onSelect={selectProfile}
+        hidden={focusMode}
+      />
+
+      {/* Answer first: the output sits at the top of the window, which the
+          dock action puts directly under the webcam. */}
+      <AnswerPanel
+        viewed={session.viewed}
+        streaming={streaming}
+        canRegenerate={canRegenerate}
+        onRegenerate={session.regenerate}
+        onCopyError={session.setError}
+        historyLength={session.history.length}
+        viewIndex={session.viewIndex}
+        idle={session.state === 'idle'}
+        onPrev={session.viewPrev}
+        onNext={session.viewNext}
+        onClear={clearHistory}
+        streamFollow={settings?.streamFollow ?? 'tail'}
+      />
+
+      {/* Next to the output it interrupts, not four rows below it. */}
+      <ErrorBox error={session.error} />
 
       <StatusLine
         state={session.state}
@@ -140,7 +232,10 @@ export function MainView({ session, settings, hotkey, onOpenSettings, onPrepareS
         hotkey={hotkey}
       />
 
-      <RecordButton ref={recordRef} state={session.state} hotkey={hotkey} onToggle={session.toggleRecord} />
+      <div className="control-row">
+        <RecordButton ref={recordRef} state={session.state} hotkey={hotkey} onToggle={session.toggleRecord} />
+        <StyleChips value={settings?.answerStyle ?? 'balanced'} onSelect={selectStyle} />
+      </div>
 
       {/* §9 pins this notice for a hotkey TAKEN by another app. An empty
           accelerator also reports registered:false, but that is the user
@@ -153,43 +248,53 @@ export function MainView({ session, settings, hotkey, onOpenSettings, onPrepareS
         </p>
       )}
 
-      {recording && (
-        <div className="recording-row">
-          <LevelMeter rms={session.rms} />
-          <span className="timer">{formatDuration(session.elapsedMs)}</span>
-        </div>
+      {/* Always rendered with a reserved height: the meter appearing must not
+          push the answer the reader is mid-sentence in. */}
+      <div className="recording-row">
+        {recording && (
+          <>
+            <LevelMeter rms={session.rms} />
+            <span className="timer">{formatDuration(session.elapsedMs)}</span>
+          </>
+        )}
+      </div>
+
+      <div className="ask-row" hidden={focusMode}>
+        <AskForm
+          disabled={active}
+          onAsk={onAsk ?? session.submitAsk}
+          showPrep={activeProfile == null || activeProfile.callType === 'interview'}
+        />
+        {session.history.length === 0 && hotkey?.registered === true && (
+          <p className="field-help hint">
+            Tip: press {formatHotkey(hotkey.accelerator)} from the meeting window — the answer streams here.
+          </p>
+        )}
+        {ungrounded && activeProfile != null && (
+          <p className="field-help hint">
+            No resume or job description saved for {activeProfile.name} — answers won't be grounded. Add them in
+            Settings.
+          </p>
+        )}
+      </div>
+
+      {settings?.llmProvider === 'local' && (
+        <aside className="local-mode-banner" aria-label="Current mode" hidden={focusMode}>
+          <strong>Free local voice · no API fees</strong>
+          <p>English system audio · CPU answers may take longer.</p>
+          <button type="button" className="ghost-button" onClick={onOpenSettings}>Local setup</button>
+        </aside>
       )}
-
-      <AskForm
-        disabled={session.state === 'starting' || session.state === 'recording' || session.state === 'finalizing'}
-        onAsk={session.submitAsk}
-      />
-
-      <StyleChips value={settings?.answerStyle ?? 'balanced'} onSelect={selectStyle} />
 
       {/* Like the answer panel's streaming decorations: the "live" tag belongs
           to the entry the STT is feeding, not to an older entry the user
           navigated back to mid-recording — that one is finished text wearing a
           pulsing tag while the real live transcript updates out of view. */}
-      <TranscriptPanel question={session.viewed?.question ?? ''} recording={recording && viewingLive} />
-
-      <AnswerPanel
-        viewed={session.viewed}
-        streaming={streaming}
-        canRegenerate={canRegenerate}
-        onRegenerate={session.regenerate}
-        onCopyError={session.setError}
-      />
-
-      <ErrorBox error={session.error} />
-
-      <HistoryBar
-        history={session.history}
-        viewIndex={session.viewIndex}
-        idle={session.state === 'idle'}
-        onPrev={session.viewPrev}
-        onNext={session.viewNext}
-        onClear={clearHistory}
+      <TranscriptPanel
+        question={session.viewed?.question ?? ''}
+        recording={recording && viewingLive}
+        active={active}
+        hidden={focusMode}
       />
 
       {/* Off-view live region for announcements whose visual anchor unmounts

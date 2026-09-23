@@ -20,7 +20,12 @@ powershell -ExecutionPolicy Bypass -File .\scripts\setup-free-voice.ps1 -DataDir
 ```
 
 Allow at least 4 GB free; 8 GB is recommended for installation, models and operating
-system headroom. Setup uses an isolated Python environment and the official
+system headroom. Those are free-space figures checked by the script on the drive
+that holds the data folder (512 MB when the runtime and model are already
+installed), not the download size. The downloads the scripts announce are the
+portable Ollama runtime (about 1.5 GB, deleted after extraction) and
+`qwen3.5:2b` (about 2.7 GB); the Python packages and the Moonshine speech model
+add to that, and their size is measured on first setup. Setup uses an isolated Python environment and the official
 portable Ollama CPU runtime. It omits the GPU libraries, which this laptop's Intel
 integrated graphics would not use. No administrator install or paid account is
 needed. The temporary Ollama ZIP is deleted after successful extraction.
@@ -36,10 +41,15 @@ Model files live in the selected folder. If you already have Ollama running,
 its existing model location applies; close that instance before setup if you
 want all models in the new folder.
 
-Select **Free local voice (Qwen3.5 2B + Moonshine)** and **Save**. Use
-**Start and warm free mode** in Settings after a restart or a long idle period.
-The services start in the background. Their readiness indicators are live checks,
-not simulated model availability. Starting and warming does not download models.
+Select **Free local voice (Qwen3.5 2B + Moonshine)** under **Keys & model →
+Answer model** and **Save**; the cloud key fields hide because this mode
+needs none. Use **Start and warm free mode** in Settings after a restart or
+a long idle period. The services start in the background (Ollama first, then
+the speech service, only whichever is missing) and the app waits up to 60 s
+for them before warming the model. The readiness indicators are live checks,
+not simulated model availability. Starting and warming does not download
+models. Runtime problems are listed under "Free local voice mode" in
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
 ## Same application flow
 
@@ -49,10 +59,10 @@ not simulated model availability. Starting and warming does not download models.
 | Live transcript | Moonshine sends revised English transcript lines |
 | Streaming answer | Ollama emits answer text; reasoning text is excluded |
 | Typed Ask / practice questions | Same question input, without speech recognition |
-| Resume and job description | Included in the same prompt |
+| Active call profile (resume, job description or call context, focus, extra instructions) | Included in the same prompt; switch profiles from the chips on the main view |
 | Brief / balanced / detailed | Same answer-style instructions |
 | Regenerate, copy, history | Same existing controls |
-| Global shortcut, topmost, screen-share protection | Existing native behavior |
+| Global shortcut, topmost, screen-capture exclusion request | Existing native behavior (capture exclusion: see [tested sharing configurations](TROUBLESHOOTING.md#tested-sharing-configurations)) |
 | Timing measurements | Real stop-to-transcript, first answer token and total time |
 
 Record captures **audio playing through the computer**, including calls or a
@@ -76,8 +86,32 @@ close unused apps and retry. A downloaded model can still fail to load when RAM
 or Windows paging space is exhausted. Keep disk space available for Windows too.
 
 - English speech only.
-- About 7 KB total for the full prompt, profile and question. Oversized input
-  fails with a clear message instead of silently dropping resume content.
+- About 7 KB (7,000 UTF-8 bytes) total for the full prompt, the **active
+  profile** and the question. The cap counts every profile field — resume,
+  job description or call context, **focus and extra instructions included**
+  — because all of them ride in the prompt. While Free local voice is
+  selected, the Profile section in Settings shows how many bytes the profile
+  you are editing leaves for the question, with the answer style chosen in
+  the form. It is computed by the app's core from your unsaved text, with
+  the same code that enforces the cap. The fixed instructions alone take
+  about 700–1,000 bytes, depending on call type and style (771 for a job
+  interview with only a resume and Balanced style). There are three states:
+  - room to spare;
+  - a warning when under 200 bytes are left (many spoken questions will not
+    fit);
+  - an error when no question fits at all. Record and Ask are then refused
+    in local mode before anything starts, and Save still works, so the
+    profile can be kept for a cloud model.
+
+  A typed question is checked at its real size before it is sent, and it
+  stays in the box if it does not fit. A spoken question can only be checked
+  after Stop. The runtime check stays the authority, and oversized input
+  fails with the message
+  `Free local mode supports about 7 KB of combined instructions, profile
+  (resume, job description, focus, extra instructions) and question. Shorten
+  the active profile in Settings or use a cloud model.` instead of silently
+  dropping profile content. A profile that fits under a cloud model may not
+  fit here; keep a shorter one for local use if you need to.
 - 8,192-token model context and up to 512 generated tokens.
 - Local first-token limit: 90 seconds; total answer limit: five minutes. Cloud
   limits remain 10 / 60 seconds. Local limits are ceilings, not speed promises.
@@ -92,7 +126,21 @@ or Windows paging space is exhausted. Keep disk space available for Windows too.
 - Services stay running after the UI closes so later tests can reuse loaded models.
   Close their task-specific Python/Ollama processes in Task Manager when finished.
 
+## Installed app versus source checkout
+
+The NSIS installer does not include `scripts\` or `local-voice\`, so free local
+voice setup currently needs a copy of this repository; the setup message in the
+app ("Run scripts\setup-free-voice.ps1 from the project folder") refers to it.
+Bundling the setup with the installer is planned, not done. Uninstalling the app
+does not remove the data folder, `local-voice.json` or the running services; the
+[user guide](../fabledocs/USER-GUIDE.md#8-free-local-voice-from-an-installed-app)
+lists the steps.
+
 ## Repeatable validation
+
+Release-level checks, including local inference with the internet off and
+cancellation followed by another local request, are listed in
+[RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md) and recorded in its ledger.
 
 See [results from this laptop](FREE_VOICE_TEST_RESULTS.md) for passed checks and
 the remaining disk-space and memory blockers.

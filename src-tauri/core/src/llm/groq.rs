@@ -7,6 +7,10 @@
 //!   product promise is first-word latency, so nothing is ever batched.
 //! * **The returned answer is the byte-for-byte concatenation of the deltas**
 //!   pushed to the sink, so the panel never shows text that later changes.
+//! * **Only `data: [DONE]` finishes an answer (R2).** Groq documents it as the
+//!   stream terminator; `finish_reason` is kept separately as metadata about
+//!   why the model stopped. Nothing after `[DONE]` is read, and a clean end of
+//!   stream before it is an incomplete answer.
 
 use std::sync::Arc;
 
@@ -17,9 +21,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{no_llm_key_message, AppError, AppResult, ErrorCode};
 use crate::llm::{
-    http, retry, warm, AnswerRequest, LlmProvider, LlmProviderKind, LlmSink, SseDecoder, SseEvent,
-    MAX_ANSWER_TOKENS,
+    ended_early, http, malformed_frame, oversized_frame, retry, warm, Answer, AnswerRequest,
+    LlmProvider, LlmProviderKind, LlmSink, SseDecoder, SseEvent, StopReason, MAX_ANSWER_TOKENS,
 };
+
+/// Used in the R2 outcome messages ("Groq stopped sending …").
+const LABEL: &str = "Groq";
 
 /// Pinned in exactly one place. Groq retires models on short notice, so a 404
 /// from this provider most likely means this constant needs updating — the
@@ -81,7 +88,7 @@ impl GroqProvider {
         sink: &Arc<dyn LlmSink>,
         cancel: &CancellationToken,
         delivered: &retry::Attempt,
-    ) -> AppResult<String> {
+    ) -> AppResult<Answer> {
         let request = http::shared_client()
             .post(format!("{}/openai/v1/chat/completions", self.base_url))
             .header("Authorization", format!("Bearer {}", self.api_key))
@@ -103,23 +110,23 @@ impl GroqProvider {
         if !(200..300).contains(&status) {
             // The body read is raced against cancel like every other await: a
             // user who pressed stop must not wait on a slow error body just to
-            // have the result thrown away.
+            // have the result thrown away. It is also capped while reading
+            // (R2): an error page is never held whole.
             let body_text = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(AppError::aborted()),
-                text = response.text() => text.unwrap_or_default(),
+                text = http::read_error_body(response) => text,
             };
             return Err(map_status(status, &body_text));
         }
 
         let mut decoder = SseDecoder::new();
-        let mut answer = String::new();
-        let mut saw_event = false;
+        let mut progress = StreamProgress::default();
         // Box::pin because reqwest only promises `impl Stream`; pinning here
         // keeps `next()` usable without caring whether that type is Unpin.
         let mut stream = Box::pin(response.bytes_stream());
 
-        loop {
+        'read: loop {
             let next = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(AppError::aborted()),
@@ -135,62 +142,128 @@ impl GroqProvider {
                     return Err(AppError::new(ErrorCode::LlmHttp, MSG_STREAM_DROPPED));
                 }
             };
-            for event in decoder.feed(&chunk) {
-                saw_event = true;
-                apply_event(&event, sink, delivered, &mut answer);
+            // On overflow, the events framed before the oversized line are
+            // still applied (so the kept partial text does not depend on
+            // chunking), and the stream fails right after them.
+            let (events, overflowed) = match decoder.feed(&chunk) {
+                Ok(events) => (events, false),
+                Err(overflow) => (overflow.decoded, true),
+            };
+            for event in events {
+                apply_event(&event, sink, delivered, &mut progress)?;
+                if progress.finished {
+                    // `[DONE]` is the terminator: bytes after it — in this
+                    // chunk or a later one — never become answer text.
+                    break 'read;
+                }
+            }
+            if overflowed {
+                return Err(oversized_frame(LABEL));
             }
         }
-        // A stream can end without a trailing newline; the flushed remainder
-        // still carries real events (see sse.rs).
-        for event in decoder.finish() {
-            saw_event = true;
-            apply_event(&event, sink, delivered, &mut answer);
+        if !progress.finished {
+            // A stream can end without a trailing newline; the flushed
+            // remainder still carries real events (see sse.rs).
+            let (events, overflowed) = match decoder.finish() {
+                Ok(events) => (events, false),
+                Err(overflow) => (overflow.decoded, true),
+            };
+            for event in events {
+                apply_event(&event, sink, delivered, &mut progress)?;
+                if progress.finished {
+                    break;
+                }
+            }
+            if overflowed && !progress.finished {
+                return Err(oversized_frame(LABEL));
+            }
         }
+        progress.conclude()
+    }
+}
 
-        if !saw_event {
-            // A 200 with no SSE events is a broken response, not an empty
-            // answer — returning Ok("") here would render as the model
-            // silently saying nothing.
-            return Err(AppError::new(
-                ErrorCode::LlmHttp,
-                "Groq returned an empty response (HTTP 200 with an empty body). Try again.",
-            ));
+/// What one attempt has seen so far. The four R2 facts — protocol completion,
+/// answer text, stop reason, and whether anything arrived at all — are kept
+/// apart so no one of them can stand in for another.
+#[derive(Default)]
+struct StreamProgress {
+    answer: String,
+    finish_reason: Option<String>,
+    /// `data: [DONE]` arrived.
+    finished: bool,
+    saw_event: bool,
+}
+
+impl StreamProgress {
+    /// Classify the attempt once the stream is over (R2).
+    fn conclude(self) -> AppResult<Answer> {
+        if !self.finished {
+            if !self.saw_event {
+                // A 200 with no SSE events is a broken response, not an empty
+                // answer — returning Ok("") here would render as the model
+                // silently saying nothing.
+                return Err(AppError::new(
+                    ErrorCode::LlmHttp,
+                    "Groq returned an empty response (HTTP 200 with an empty body). Try again.",
+                ));
+            }
+            return Err(ended_early(LABEL));
         }
-        Ok(answer)
+        Answer::from_terminal(
+            LABEL,
+            self.answer,
+            StopReason::from_provider(self.finish_reason.as_deref()),
+        )
     }
 }
 
 /// Interpret one OpenAI-style SSE event. The delta is
-/// `choices[0].delta.content`; everything else (role priming, finish_reason
-/// chunks, usage frames) carries no answer text and is ignored.
+/// `choices[0].delta.content`; role priming, `finish_reason` chunks, usage
+/// frames and fields added later carry no answer text and are harmless.
 fn apply_event(
     event: &SseEvent,
     sink: &Arc<dyn LlmSink>,
     delivered: &retry::Attempt,
-    answer: &mut String,
-) {
-    // `data: [DONE]` is a sentinel to SKIP, not a terminator: bytes after it
-    // in the same chunk are still real events. SseDecoder already handles the
-    // framing; stopping here would truncate whatever followed.
+    progress: &mut StreamProgress,
+) -> AppResult<()> {
+    progress.saw_event = true;
     if event.is_done_sentinel() {
-        return;
+        progress.finished = true;
+        return Ok(());
     }
     let Ok(value) = serde_json::from_str::<Value>(&event.data) else {
-        // A single mangled event must not cost the whole answer.
-        return;
+        // Every chunk before `[DONE]` is JSON. One that does not parse may
+        // have carried answer text; skipping it and then reporting a finished
+        // answer is the silent truncation R2 exists to prevent.
+        return Err(malformed_frame(LABEL));
     };
-    if let Some(text) = value["choices"][0]["delta"]["content"].as_str() {
+    if let Some(error) = value.get("error") {
+        // OpenAI-style structured error frame mid-stream. Surface the detail;
+        // ignoring it used to let the stream end "successfully".
+        let detail = error["message"].as_str().unwrap_or("unknown error");
+        return Err(AppError::new(
+            ErrorCode::LlmHttp,
+            format!("Groq reported an error mid-stream: {detail}"),
+        ));
+    }
+    let choice = &value["choices"][0];
+    if let Some(reason) = choice["finish_reason"].as_str() {
+        // Why the model stopped: metadata only, never completion (R2).
+        progress.finish_reason = Some(reason.to_string());
+    }
+    if let Some(text) = choice["delta"]["content"].as_str() {
         if text.is_empty() {
             // The role-priming first chunk carries an empty content string;
             // forwarding it wakes the UI for nothing and cannot change the
             // returned answer.
-            return;
+            return Ok(());
         }
         delivered.mark_delta_emitted();
-        answer.push_str(text);
+        progress.answer.push_str(text);
         // Pushed the moment it is decoded — never batched.
         sink.on_delta(text.to_string());
     }
+    Ok(())
 }
 
 #[async_trait]
@@ -200,7 +273,7 @@ impl LlmProvider for GroqProvider {
         req: &AnswerRequest,
         sink: Arc<dyn LlmSink>,
         cancel: CancellationToken,
-    ) -> AppResult<String> {
+    ) -> AppResult<Answer> {
         if self.api_key.trim().is_empty() {
             // Checked before any network work: a missing key is a settings
             // problem, and opening a connection to discover it wastes the
@@ -333,7 +406,7 @@ mod tests {
 
     fn request() -> AnswerRequest {
         let system = build_system_prompt(
-            Profile { resume: "Ten years of Rust.", job_description: "Staff engineer." },
+            Profile { resume: "Ten years of Rust.", job_description: "Staff engineer.", ..Default::default() },
             AnswerStyle::Balanced,
         );
         AnswerRequest::new(system).with_transcript("Tell me about yourself.")
@@ -438,10 +511,30 @@ mod tests {
         )
     }
 
+    const DONE: &str = "data: [DONE]\n\n";
+
+    fn finish_chunk(reason: &str) -> String {
+        format!("data: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{reason}\"}}]}}\n\n")
+    }
+
+    /// Resolves with the answer TEXT — the stop reason has its own tests.
     async fn run(provider: &GroqProvider, sink: Arc<RecordingSink>) -> AppResult<String> {
+        run_full(provider, sink).await.map(|a| a.text)
+    }
+
+    async fn run_full(provider: &GroqProvider, sink: Arc<RecordingSink>) -> AppResult<Answer> {
         provider
             .stream_answer(&request(), sink, CancellationToken::new())
             .await
+    }
+
+    async fn run_body(body: &str) -> (AppResult<Answer>, Vec<String>) {
+        let (base, _rx) = serve_once(sse_response(body)).await;
+        let provider = GroqProvider::new("test-key").with_base_url(base);
+        let sink = Arc::new(RecordingSink::default());
+        let result = run_full(&provider, sink.clone()).await;
+        let deltas = sink.deltas.lock().unwrap().clone();
+        (result, deltas)
     }
 
     /// Accept exactly two sequential connections, answering each with its own
@@ -502,23 +595,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn done_sentinel_followed_by_more_data_in_the_same_chunk_does_not_truncate() {
-        // Everything arrives in ONE write: a decoder or provider loop that
-        // treats [DONE] as a terminator drops the trailing " world".
-        let body = format!("{}data: [DONE]\n\n{}", delta_event("Hello"), delta_event(" world"));
-        let (base, _rx) = serve_once(sse_response(&body)).await;
-        let provider = GroqProvider::new("test-key").with_base_url(base);
-        let sink = Arc::new(RecordingSink::default());
-        let answer = run(&provider, sink.clone()).await.unwrap();
-        assert_eq!(answer, "Hello world");
-        assert_eq!(answer.as_bytes(), sink.deltas.lock().unwrap().concat().as_bytes());
+    async fn nothing_after_the_done_sentinel_is_consumed() {
+        // R2 reversed the old rule on purpose. Groq documents `data: [DONE]`
+        // as the stream TERMINATOR, so it is the only proof the answer
+        // finished — and anything after it, even in the same write, is not
+        // part of the answer. The old test expected " world" to be appended;
+        // painting text after the terminator is what a garbled or
+        // concatenated stream looks like.
+        let body = format!("{}{DONE}{}", delta_event("Hello"), delta_event(" world"));
+        let (result, deltas) = run_body(&body).await;
+        let answer = result.unwrap();
+        assert_eq!(answer.text, "Hello");
+        assert_eq!(deltas, vec!["Hello".to_string()], "no delta after [DONE] may paint");
     }
 
     // ---- request shape -----------------------------------------------------
 
     #[tokio::test]
     async fn request_pins_model_streaming_reasoning_knobs_and_omits_reasoning_format() {
-        let (base, rx) = serve_once(sse_response(&delta_event("ok"))).await;
+        let (base, rx) = serve_once(sse_response(&format!("{}{DONE}", delta_event("ok")))).await;
         let provider = GroqProvider::new("test-key").with_base_url(base);
         let req = request();
         provider
@@ -709,5 +804,118 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::NoLlmKey);
         assert!(err.message.contains("Groq"), "message was: {}", err.message);
+    }
+
+    // ---- R2: protocol completion vs finish reason ----------------------------
+
+    #[tokio::test]
+    async fn length_finish_completes_with_a_token_limit_reason() {
+        // A capped answer is kept and labelled "cut short", not failed.
+        let body = format!("{}{}{DONE}", delta_event("Long"), finish_chunk("length"));
+        let (result, _) = run_body(&body).await;
+        let answer = result.expect("a capped answer is still an answer");
+        assert_eq!(answer.text, "Long");
+        assert_eq!(answer.stop_reason, StopReason::TokenLimit);
+        let (normal, _) = run_body(&format!("{}{}{DONE}", delta_event("x"), finish_chunk("stop"))).await;
+        assert_eq!(normal.unwrap().stop_reason, StopReason::Complete);
+    }
+
+    #[tokio::test]
+    async fn a_finish_reason_without_done_is_incomplete_and_keeps_the_text() {
+        // `finish_reason` is metadata, not the terminator.
+        let body = format!("{}{}", delta_event("Almost"), finish_chunk("stop"));
+        let (result, deltas) = run_body(&body).await;
+        let err = result.unwrap_err();
+        assert_eq!(err.code, ErrorCode::LlmHttp);
+        assert!(err.message.contains("before the answer was finished"), "{}", err.message);
+        assert_eq!(deltas, vec!["Almost".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn role_only_stream_that_finishes_is_an_explicit_failure() {
+        // Used to resolve Ok(""): a blank "success".
+        let body = format!(
+            "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"\"}}}}]}}\n\n{}{DONE}",
+            finish_chunk("stop")
+        );
+        let (result, deltas) = run_body(&body).await;
+        assert!(result.unwrap_err().message.contains("without any answer text"));
+        assert!(deltas.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_structured_error_frame_after_partial_output_fails_with_its_detail() {
+        // The OpenAI-style `error` object used to be ignored, letting the
+        // stream end "successfully" with half an answer.
+        let body = format!(
+            "{}data: {{\"error\":{{\"message\":\"Model overloaded\",\"type\":\"server_error\"}}}}\n\n{DONE}",
+            delta_event("Half")
+        );
+        let (result, deltas) = run_body(&body).await;
+        let err = result.unwrap_err();
+        assert_eq!(err.code, ErrorCode::LlmHttp);
+        assert!(err.message.contains("Model overloaded"), "{}", err.message);
+        assert_eq!(deltas, vec!["Half".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_frame_fails_instead_of_silently_dropping_text() {
+        let body = format!("{}data: {{\"choices\":[{{\"delta\":{{\"content\":\"lo\n\n{DONE}", delta_event("Hel"));
+        let (result, deltas) = run_body(&body).await;
+        assert!(result.unwrap_err().message.contains("malformed"));
+        assert_eq!(deltas, vec!["Hel".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn usage_only_and_unknown_frames_are_harmless() {
+        let body = format!(
+            "{}data: {{\"choices\":[],\"usage\":{{\"completion_tokens\":3}}}}\n\n\
+             data: {{\"x_groq\":{{\"id\":\"req_1\"}}}}\n\n{}{DONE}",
+            delta_event("Fine"),
+            finish_chunk("stop")
+        );
+        let (result, deltas) = run_body(&body).await;
+        assert_eq!(result.unwrap().text, "Fine");
+        assert_eq!(deltas, vec!["Fine".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_frame_is_refused_while_reading() {
+        // 1.1 MiB of one line, then the server stalls: only a cap enforced
+        // while reading returns here.
+        let mut head = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 10000000\r\n\r\n{}data: ",
+            delta_event("Start")
+        )
+        .into_bytes();
+        head.extend_from_slice(&vec![b'x'; 1_100_000]);
+        let base = serve_then_stall(head).await;
+        let provider = GroqProvider::new("test-key").with_base_url(base);
+        let sink = Arc::new(RecordingSink::default());
+        let err = tokio::time::timeout(Duration::from_secs(20), run(&provider, sink.clone()))
+            .await
+            .expect("the cap must end the read")
+            .unwrap_err();
+        assert!(err.message.contains("oversized"), "{}", err.message);
+        assert_eq!(sink.deltas.lock().unwrap().clone(), vec!["Start".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn an_endless_error_body_is_read_only_up_to_the_cap() {
+        // 4xx other than the mapped ones quotes a snippet of the body; the
+        // body read must stop at the cap instead of waiting for 10 MB.
+        let mut head = b"HTTP/1.1 400 Bad Request\r\ncontent-length: 10000000\r\n\r\n".to_vec();
+        head.extend_from_slice(&vec![b'e'; 64 * 1024]);
+        let base = serve_then_stall(head).await;
+        let provider = GroqProvider::new("test-key").with_base_url(base);
+        let err = tokio::time::timeout(
+            Duration::from_secs(20),
+            run(&provider, Arc::new(RecordingSink::default())),
+        )
+        .await
+        .expect("a capped error body read must return")
+        .unwrap_err();
+        assert!(err.message.contains("HTTP 400"), "{}", err.message);
+        assert!(err.message.len() < 400, "message length was {}", err.message.len());
     }
 }

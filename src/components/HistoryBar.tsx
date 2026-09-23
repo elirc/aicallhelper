@@ -1,7 +1,9 @@
-import type { HistoryEntry } from '../state/useSession';
-
 interface HistoryBarProps {
-  history: HistoryEntry[];
+  /**
+   * A count, not the array: the bar lives inside the memo'd answer panel,
+   * and the history array's identity changes on every streamed token.
+   */
+  historyLength: number;
   viewIndex: number;
   /** Clearing mid-session would delete the entry currently being written. */
   idle: boolean;
@@ -11,10 +13,10 @@ interface HistoryBarProps {
 }
 
 /** Prev/next navigation over past answers. */
-export function HistoryBar({ history, viewIndex, idle, onPrev, onNext, onClear }: HistoryBarProps) {
+export function HistoryBar({ historyLength, viewIndex, idle, onPrev, onNext, onClear }: HistoryBarProps) {
   // With one entry there is nothing to navigate to; the bar only earns its
-  // vertical space in a 700px window once a second entry exists.
-  if (history.length < 2) return null;
+  // space in the panel head once a second entry exists.
+  if (historyLength < 2) return null;
   return (
     <nav className="history-bar" aria-label="Answer history">
       <button
@@ -27,13 +29,13 @@ export function HistoryBar({ history, viewIndex, idle, onPrev, onNext, onClear }
         ‹
       </button>
       <span className="history-label">
-        {viewIndex + 1}/{history.length}
+        {viewIndex + 1}/{historyLength}
       </span>
       <button
         type="button"
         className="ghost-button history-arrow"
         aria-label="Next answer"
-        disabled={viewIndex >= history.length - 1}
+        disabled={viewIndex >= historyLength - 1}
         onClick={onNext}
       >
         ›

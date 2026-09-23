@@ -39,7 +39,7 @@ every §5 invariant with fakes — no webview, no network, no audio device
 
 ## Consequences
 
-- 233 core tests run in seconds with a paused tokio clock; every race that was
+- The core tests (count in TESTING.md) run in seconds with a paused tokio clock; every race that was
   a production incident in v2 is now a deterministic regression test (ADR 003).
 - The latency path is one process, one language, measurable end to end. The
   prewarm design (ADR 005) only became possible because the core owns the HTTP
@@ -47,9 +47,13 @@ every §5 invariant with fakes — no webview, no network, no audio device
 - WASAPI is used directly through `cpal` with proper realtime-thread
   discipline: the data callback does nothing but resample, frame, and
   `try_send` (`capture.rs:97-105`).
-- Content protection is one call at window build
-  (`src-tauri/src/lib.rs:93-97`), and launch **fails** if the OS refuses —
-  no Electron-style "hope the flag worked".
+- Capture exclusion is requested at window build and then verified: the
+  shell reads the display affinity back from Windows and launch **fails**
+  unless it is `WDA_EXCLUDEFROMCAPTURE` (Windows 10 version 2004+) — no
+  Electron-style "hope the flag worked" (`src-tauri/src/lib.rs`,
+  `window::verify_capture_exclusion`). Whether a given conferencing app
+  honours the exclusion depends on its capture method and is only known from
+  recorded tests.
 
 Costs, honestly:
 

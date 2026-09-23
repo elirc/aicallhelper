@@ -1,7 +1,7 @@
 {
   "name": "aicallhelper",
   "private": true,
-  "version": "3.0.0",
+  "version": "3.1.0",
   "type": "module",
   "description": "AI Call Assistant v3 — push-to-record interview copilot for Windows",
   "scripts": {
@@ -15,7 +15,6 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2.1.1",
-    "@tauri-apps/plugin-global-shortcut": "^2.2.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },

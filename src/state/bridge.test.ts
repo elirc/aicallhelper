@@ -49,7 +49,13 @@ describe('envelope discipline', () => {
     await expect(b.startSession()).resolves.toMatchObject({ ok: false });
     await expect(b.stopSession(1)).resolves.toMatchObject({ ok: false });
     await expect(b.ask('q')).resolves.toMatchObject({ ok: false });
+    await expect(b.sessionOutcome(1)).resolves.toMatchObject({ ok: false });
     await expect(b.hotkeyStatus()).resolves.toMatchObject({ ok: false });
+    await expect(b.dockToCamera()).resolves.toMatchObject({ ok: false });
+    await expect(b.localVoiceStatus()).resolves.toMatchObject({ ok: false });
+    await expect(b.prepareLocalVoice()).resolves.toMatchObject({ ok: false });
+    const profile = { id: 'a', name: 'A', callType: 'interview' as const, resume: '', jobDescription: '', focus: '', extraInstructions: '' };
+    await expect(b.localPromptBudget(profile, 'balanced', '')).resolves.toMatchObject({ ok: false });
   });
 });
 
@@ -59,8 +65,8 @@ describe('command wiring', () => {
     const b = getBridge();
     await b.getSettings();
     expect(mockInvoke).toHaveBeenLastCalledWith('get_settings', undefined);
-    await b.setSettings({ resume: 'r' });
-    expect(mockInvoke).toHaveBeenLastCalledWith('set_settings', { patch: { resume: 'r' } });
+    await b.setSettings({ activeProfileId: 'b' });
+    expect(mockInvoke).toHaveBeenLastCalledWith('set_settings', { patch: { activeProfileId: 'b' } });
     await b.startSession();
     expect(mockInvoke).toHaveBeenLastCalledWith('start_session', undefined);
     // Tauri maps the Rust `session_id` parameter to a camelCase `sessionId`
@@ -69,8 +75,21 @@ describe('command wiring', () => {
     expect(mockInvoke).toHaveBeenLastCalledWith('stop_session', { sessionId: 4 });
     await b.ask('hello');
     expect(mockInvoke).toHaveBeenLastCalledWith('ask', { text: 'hello' });
+    // Same camelCase argument-key rule as stop_session (R1 reconciliation).
+    await b.sessionOutcome(4);
+    expect(mockInvoke).toHaveBeenLastCalledWith('session_outcome', { sessionId: 4 });
     await b.hotkeyStatus();
     expect(mockInvoke).toHaveBeenLastCalledWith('hotkey_status', undefined);
+    await b.dockToCamera();
+    expect(mockInvoke).toHaveBeenLastCalledWith('dock_to_camera', undefined);
+    await b.localVoiceStatus();
+    expect(mockInvoke).toHaveBeenLastCalledWith('local_voice_status', undefined);
+    await b.prepareLocalVoice();
+    expect(mockInvoke).toHaveBeenLastCalledWith('prepare_local_voice', undefined);
+    // R4: Rust's `answer_style` parameter is the camelCase `answerStyle` key.
+    const profile = { id: 'a', name: 'A', callType: 'interview' as const, resume: 'R', jobDescription: '', focus: '', extraInstructions: '' };
+    await b.localPromptBudget(profile, 'brief', 'Hi?');
+    expect(mockInvoke).toHaveBeenLastCalledWith('local_prompt_budget', { profile, answerStyle: 'brief', question: 'Hi?' });
     b.cancelSession(9);
     expect(mockInvoke).toHaveBeenLastCalledWith('cancel_session', { sessionId: 9 });
   });
@@ -106,12 +125,12 @@ describe('events', () => {
     const fire = captureListen(Promise.resolve(unlisten));
 
     const handler = vi.fn();
-    const off = getBridge().on('llm:delta', handler);
-    await Promise.resolve();
+    const sub = getBridge().on('llm:delta', handler);
+    await expect(sub.ready).resolves.toEqual({ ok: true, value: null });
     fire({ sessionId: 1, delta: 'hi' });
     expect(handler).toHaveBeenCalledWith({ sessionId: 1, delta: 'hi' });
 
-    off();
+    sub.unsubscribe();
     expect(unlisten).toHaveBeenCalledTimes(1);
     fire({ sessionId: 1, delta: 'late' });
     expect(handler).toHaveBeenCalledTimes(1);
@@ -127,14 +146,52 @@ describe('events', () => {
       }),
     );
 
-    const off = getBridge().on('llm:delta', handler);
-    off(); // torn down before the Tauri registration finished
+    const sub = getBridge().on('llm:delta', handler);
+    sub.unsubscribe(); // torn down before the Tauri registration finished
     resolveListen(unlisten);
     await Promise.resolve();
     await Promise.resolve();
     expect(unlisten).toHaveBeenCalledTimes(1);
     fire({ sessionId: 1, delta: 'ghost' });
     expect(handler).not.toHaveBeenCalled();
+  });
+});
+
+describe('listener readiness (R1)', () => {
+  it('a failed registration surfaces as an error envelope instead of being swallowed', async () => {
+    // The old bridge caught and dropped this, so the UI started sessions
+    // whose events could never arrive and waited forever.
+    mockListen.mockRejectedValueOnce(new Error('ipc not ready'));
+    const sub = getBridge().on('session:error', vi.fn());
+    const ready = await sub.ready;
+    expect(ready.ok).toBe(false);
+    if (!ready.ok) {
+      expect(ready.error.code).toBe('internal');
+      expect(ready.error.message).toContain('session:error');
+      expect(ready.error.message).toContain('ipc not ready');
+    }
+    // Unsubscribing a failed registration is harmless.
+    expect(() => sub.unsubscribe()).not.toThrow();
+  });
+
+  it('ready stays pending until the registration actually completes', async () => {
+    let resolveListen!: (un: () => void) => void;
+    mockListen.mockImplementationOnce(
+      () =>
+        new Promise<() => void>((r) => {
+          resolveListen = r;
+        }),
+    );
+    const sub = getBridge().on('llm:done', vi.fn());
+    let settled = false;
+    void sub.ready.then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    resolveListen(() => undefined);
+    await expect(sub.ready).resolves.toEqual({ ok: true, value: null });
   });
 });
 

@@ -40,7 +40,7 @@ scripted local servers that control the exact bytes (docs/TESTING.md, intro).
 
 ## Consequences
 
-- 233 core tests run in seconds, and every §5 race is a pinned regression
+- The core tests (count in TESTING.md) run in seconds, and every §5 race is a pinned regression
   test. The fakes can express things reality only produces under load:
   `dead_on_arrival` errors fired inside `connect` before the stream exists
   (`machine.rs:917-921`), deltas pushed from a detached task after the

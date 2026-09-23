@@ -1,5 +1,5 @@
 use app_core::llm::LlmProviderKind;
-use app_core::store::{SettingsPatch, SettingsStore};
+use app_core::store::{CallProfilePatch, SettingsPatch, SettingsStore, DEFAULT_PROFILE_ID};
 
 #[test]
 fn local_mode_round_trips_without_requiring_or_clearing_cloud_keys() {
@@ -14,8 +14,13 @@ fn local_mode_round_trips_without_requiring_or_clearing_cloud_keys() {
         .unwrap();
     store
         .apply_patch(SettingsPatch {
-            llm_provider: Some("local".into()),
-            resume: Some("My experience".into()),
+            llm_provider: Some(LlmProviderKind::Local),
+            profiles: Some(vec![CallProfilePatch {
+                id: DEFAULT_PROFILE_ID.into(),
+                name: "Default".into(),
+                resume: "My experience".into(),
+                ..Default::default()
+            }]),
             ..Default::default()
         })
         .unwrap();
@@ -23,7 +28,7 @@ fn local_mode_round_trips_without_requiring_or_clearing_cloud_keys() {
     assert_eq!(store.get().active_llm_key(), None);
     let restored = SettingsStore::load_from(dir.path());
     assert_eq!(restored.get().llm_provider, LlmProviderKind::Local);
-    assert_eq!(restored.get().resume, "My experience");
+    assert_eq!(restored.get().active_profile().resume, "My experience");
     assert_eq!(
         restored.get().anthropic_key.as_deref(),
         Some("existing-answer-test-key")

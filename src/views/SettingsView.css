@@ -1,0 +1,190 @@
+/*
+ * Settings view only. Imported by SettingsView.tsx (a lazy chunk) so these
+ * rules ship with it and never cost the main view a byte. Shared tokens,
+ * buttons and `.field-help` live in styles.css.
+ */
+
+/* Fixed-height column: the form scrolls, the action row stays put. */
+.settings-view {
+  height: 100vh;
+  min-height: 0;
+}
+
+.settings-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.settings-section {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 0;
+  padding: 10px 12px 12px;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.settings-section > legend {
+  padding: 0 6px;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.field input,
+.field select,
+.field textarea {
+  width: 100%;
+}
+
+.field textarea {
+  resize: vertical;
+}
+
+.field--checkbox {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+
+.field--checkbox input {
+  width: auto;
+  accent-color: var(--accent);
+}
+
+.field-label {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.field-help--warn {
+  color: var(--warn);
+}
+
+/* Profile select + New/Duplicate/Delete on one wrapping line. */
+.profile-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.profile-toolbar select {
+  flex: 1 1 140px;
+  min-width: 0;
+  width: auto;
+}
+
+.settings-note {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+/* Sticky at the bottom of the scrolling form: Save is reachable without
+   scrolling past a 200 000-character resume. */
+.settings-actions {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: auto;
+  padding-top: 10px;
+  padding-bottom: 2px;
+  background: var(--bg);
+  border-top: 1px solid var(--border);
+}
+
+.settings-actions-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.saved-note {
+  color: #6fce91; /* bright green: ≥7:1 on --bg, readable at 13px */
+  font-size: 13px;
+}
+
+/* Inline dirty guard (role=alertdialog): no overlay in a 460px window. */
+.discard-dialog {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  border: 1px solid var(--warn);
+  border-radius: var(--radius);
+  background: var(--bg-raised);
+  font-size: 13px;
+}
+
+.discard-dialog p {
+  margin: 0;
+  flex: 1 1 auto;
+}
+
+/*
+ * The save lock (R3): a borderless fieldset around the whole form, so one
+ * `disabled` covers every control. It carries the form's column layout
+ * itself rather than `display: contents`, which older WebView2 builds did
+ * not apply to fieldsets.
+ */
+.settings-lock {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.field-help--error {
+  color: var(--danger);
+}
+
+/* Startup storage problem (quarantined or unreadable settings file). */
+.settings-warning {
+  margin: 0 0 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--warn);
+  border-radius: var(--radius);
+  font-size: 13px;
+}
+
+/* "Settings changed elsewhere — reload" (R5): same inline shape as the guard. */
+.settings-conflict {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  border: 1px solid var(--warn);
+  border-radius: var(--radius);
+  background: var(--bg-raised);
+  font-size: 13px;
+}
+
+.settings-conflict p {
+  margin: 0;
+  flex: 1 1 auto;
+}

@@ -23,12 +23,15 @@ cancelled the work, and the UI is required to stay silent about it
 Settings (gear icon) and add it.` (`core/src/error.rs:97-98`)
 
 **What happened:** Record was pressed with no stored Deepgram key. Checked at
-the command gate before anything opens (`src-tauri/src/commands.rs:118-119`)
-and again inside the connector so no socket is ever dialed just to be
-rejected (`core/src/stt/deepgram.rs:76-79`).
+the command gate before anything opens (`src-tauri/src/commands.rs:172`,
+`required_deepgram_key` at `commands.rs:394-401`) and again inside the
+connector so no socket is ever dialed just to be rejected
+(`core/src/stt/deepgram.rs:76-79`). Never raised while **Free local voice**
+is selected: that provider's `uses_deepgram()` is false, so speech goes to
+the loopback Moonshine service and no Deepgram key is required.
 
 **Fix:** gear icon → paste the Deepgram key → Save. A key of only whitespace
-counts as missing (`src-tauri/src/commands.rs:318-320`).
+counts as missing (`src-tauri/src/commands.rs:411-413`).
 
 ### `no_llm_key`
 
@@ -37,9 +40,12 @@ Open Settings (gear icon) and add it.` (`core/src/error.rs:102-104`)
 
 **What happened:** the key for the **selected** provider is missing. If you
 switched the provider to Groq, a saved Anthropic key does not count — the
-check runs against `active_llm_key()` (`src-tauri/src/commands.rs:121-127`,
-and per-provider before any dial: `core/src/llm/anthropic.rs` (`stream_answer`),
-`core/src/llm/groq.rs:204-212`).
+check runs against `active_llm_key()` (`required_llm_key`,
+`src-tauri/src/commands.rs:403-409`, and per-provider before any dial:
+`core/src/llm/anthropic.rs` (`stream_answer`), `core/src/llm/groq.rs:204-212`).
+Never raised while **Free local voice** is selected: `needs_cloud_keys()` is
+false for it, so the gate returns an empty key and no cloud provider is ever
+built (`commands.rs:362-388`).
 
 **Fix:** add the key for the provider named in the message, or switch the
 provider back.
@@ -177,23 +183,43 @@ meanings:
 | `… returned an empty response …` | `anthropic.rs:187-196` / `groq.rs:150-158` | HTTP 200 with zero SSE events — a broken response, refused rather than rendered as the model silently saying nothing. |
 | `Anthropic reported an error mid-stream: {detail}` | `anthropic.rs:230-238` | The SSE stream itself carried an error event. |
 
+### `settings_conflict`
+
+**You see:** in Settings, *"Settings changed elsewhere — reload. Your unsaved
+edits are kept."* The Save button is disabled. (The core's message is
+`Settings changed while this form was open. Reload it.`,
+`core/src/store/settings.rs`.)
+
+**What happened:** the form was opened from an older saved state than the
+one now committed. Usually a profile or style chip click was still saving
+when Settings opened. Nothing was saved (ADR 016). Press **Reload**: fields
+you edited keep your text, fields you did not touch take the saved values,
+and then Save works. A window move never causes this, because geometry saves
+do not count as a settings change.
+
 ### `llm_first_token_timeout`
 
 **You see:** `The model did not start answering in time. Try again.`
 (`core/src/session/machine.rs:717-727`)
 
 **What happened:** 10 s elapsed after Stop with no first delta
-(`core/src/session/mod.rs:137-138`). The timer is disarmed by the first
-delta; once tokens flow only the 60 s total cap applies
-(`core/src/session/machine.rs:708-716`). Deltas that race in after the
-timeout fired paint nothing (`core/src/session/machine.rs:456-466`).
+(`core/src/session/mod.rs:139`) — or **90 s** in Free local voice mode
+(`mod.rs:143`): the deadline pair comes from the provider's
+`answer_limits()` (`AnswerLimits::CLOUD` / `LOCAL`, `mod.rs:162-175`), armed
+at `core/src/session/machine.rs:705-707`. The timer is disarmed by the first
+delta; once tokens flow only the total cap applies. Deltas that race in
+after the timeout fired paint nothing (`machine.rs:456-466`). In local mode
+a first token that takes tens of seconds is CPU inference on a 2B model
+ingesting the whole prompt — see [Free local voice mode](#free-local-voice-mode)
+before blaming the network.
 
 ### `llm_timeout`
 
 **You see:** `The answer took too long and was stopped. Try again.`
 (`core/src/session/machine.rs:729-739`)
 
-**What happened:** 60 s total elapsed. Whatever streamed before the cap stays
+**What happened:** 60 s total elapsed — **300 s** in Free local voice mode
+(`core/src/session/mod.rs:141,144`). Whatever streamed before the cap stays
 in the panel — an error during a streaming answer keeps the partial (§9).
 
 ### `internal`
@@ -213,14 +239,53 @@ recognizing:
   (`core/src/audio/capture.rs:218,261-286`). Device errors are phase-aware:
   after Stop was pressed they are ignored, so a Bluetooth dropout cannot kill
   an answer already streaming (`core/src/session/machine.rs:353-390`).
+- `The audio capture thread failed to start. Try restarting the app.`
+  (`src-tauri/src/commands.rs:246-248`) — the WASAPI open, which runs on
+  tokio's blocking pool, panicked before it could report a device (RS-2).
+  Distinct from the device messages above on purpose: there is no device to
+  fix, the process is unhealthy. The machine session was cancelled silently,
+  so nothing else is coming for it.
 - `Stop not taken: that session is unknown, already stopping, or already
   ended. No further events will arrive for it.`
-  (`src-tauri/src/commands.rs:204-209`) — the stop contract's return value
+  (`src-tauri/src/commands.rs:267-271`) — the stop contract's return value
   (§4/§5.3). You should never see this rendered; the UI uses it to leave
-  "Finalizing…" (`src/state/useSession.ts:89-92`).
-- `Could not save settings: {io error}` (`core/src/store/settings.rs:97-100`)
+  "Finalizing…" (`src/state/useSession.ts`, the stop path).
+- `Could not save settings: {io error}` (`core/src/store/settings.rs:129`)
   — the atomic write failed (full disk, locked file). Memory still matches
-  disk: nothing was half-saved.
+  disk: nothing was half-saved. `Could not save settings. Try again.`
+  (`src-tauri/src/commands.rs:103-105`) is its rarer sibling: the blocking
+  task that performs the write panicked; the store's mutex recovers from
+  poisoning, so a second Save has every chance.
+- `Your settings file was damaged and could not be read. It was kept as
+  settings.json.corrupt-<seconds> in the app's data folder, and the app
+  started with default settings.` (`core/src/store/settings.rs`,
+  `load_from`, ADR 016). This is shown at launch and as a note in Settings.
+  The file held no JSON object (a hand edit gone wrong, or disk damage). The
+  copy sits in `%APPDATA%\com.aicallhelper.app\`. Recover text from it if
+  you need to. Saving works normally, and the first save clears the note.
+- `Your settings file could not be read (…)` / `Your settings file is
+  damaged and a backup copy could not be made (…)`. The app is running on
+  defaults and **refuses every save**, so it never overwrites a file it could
+  not read or preserve. Close whatever has `settings.json` open (an editor,
+  a sync or backup tool, an antivirus scan). For the damaged case, move the
+  file out of the data folder. Then restart the app.
+- `Could not find the display this window is on.`
+  (`src-tauri/src/window.rs:112`) — the ⬆ **Dock to camera** button could
+  resolve neither the window's current monitor nor a primary one. Rare
+  (remote desktop mid-reconnect, a display set in flux); the window stays
+  where it is. On the launch path the same failure is swallowed and the
+  sanitizer's placement stands. `Could not move the window: …` is the OS
+  refusing a size or position call on the same path.
+- `The main window is not available.` — a window command (`dock_to_camera`)
+  ran while the main window was already gone; only reachable during
+  shutdown.
+- Settings saved from the wrong thread cannot happen any more: `set_settings`
+  is async and does its write on the blocking pool (RS-3), so a slow disk
+  stalls the Save button, never the paint.
+- Free local voice messages (`Free voice is not installed yet…`, `Free mode
+  is already starting…`, `Local speech did not start…`, `Qwen3.5 2B is not
+  installed in the running Ollama service…`) are listed in
+  [Free local voice mode](#free-local-voice-mode).
 
 ---
 
@@ -264,42 +329,80 @@ through the causes in order:
    the CloseStream flush (`core/src/session/machine.rs:392-396`). A meter
    that freezes the instant you press Stop is correct behavior.
 
-### Window opens centered instead of where you left it
+### Window opens at the top of the screen instead of where you left it
 
-Centering is the sanitizer's *deliberate* verdict: the saved position is
-honored only when it can be proven visible right now
-(`core/src/store/bounds.rs:81-117`). The rules, each of which can eat a
-position:
+That is the default, not a bug: **Window position at launch** is set to
+"Dock under the camera (top centre)" (`launchPlacement: "camera"`, the
+default — `core/src/store/mod.rs:110-120`). Every launch keeps the saved
+*size* and replaces the *position* with the top-centre of the display the
+window is on, 8 px below the work-area edge, before the window is shown
+(`src-tauri/src/lib.rs:110-117`, `src-tauri/src/window.rs:106-135`). The
+position you dragged to is still saved; it is simply not used at launch.
+To get the v3 behaviour back, switch the setting to "Remember where I left
+it". The ⬆ **Dock to camera** button does the same move at any time, at the
+wide reading preset (600 logical px wide, 45 % of the display height,
+clamped to 520–720 logical px). ADR 013 has the reasoning.
+
+**A docked window vanishes behind the call.** You turned "Keep this window
+always on top" off. A docked window drops behind the call app the moment
+the call is focused; it looks like the dock "did not work". Turn always-on-top
+back on.
+
+**First run looks smaller or larger than you expect on a hi-DPI laptop —
+or, rather, it no longer does.** The first-run size is the builder's
+*logical* 460×700, which tao scales by DPI; the app used to re-apply it as
+physical pixels and shrink the window by the scale factor, then persist that
+as your "choice" (RS-7). The sanitizer now reports whether bounds came from
+the file (`from_saved`) and the shell only calls `set_size` when they did
+(`core/src/store/bounds.rs:59-76`, `window.rs:45-47`). If an old
+settings file still carries a too-small saved size, drag the window larger
+once; the next save fixes it.
+
+### Window opens at the top (or centred) with "Remember where I left it" set
+
+Then the placement is the sanitizer's *deliberate* verdict: the saved
+position is honored only when it can be proven visible right now
+(`core/src/store/bounds.rs:101-137`), and when it cannot, the window is
+docked to the camera at its saved size — centred only if even the dock fails
+because no display can be resolved (`src-tauri/src/window.rs:42-58`). The
+rules, each of which can eat a position:
 
 - **The 40 px rule:** at least 40 px of the window must land on some
   display's work area on *both* axes — enough to grab the ~32 px title bar
-  and drag it back (`core/src/store/bounds.rs:19-22,107-110`). 39 px fails.
+  and drag it back (`core/src/store/bounds.rs:31-34`). 39 px fails.
 - **Both axes on the same display:** an L-shaped monitor arrangement cannot
-  satisfy one axis per monitor (`bounds.rs:199-206` test).
+  satisfy one axis per monitor (pinned by test).
 - **Judged at the clamped size:** size is clamped up to the 380×520 minimum
-  *first*, and visibility is judged at that size (`bounds.rs:76-80`).
+  *first*, and visibility is judged at that size (`bounds.rs:122-123`). The
+  minimum is the logical floor at 100 % scale on purpose (DOCK-4): on a
+  hi-DPI display the OS enforces a larger floor, and judging at the smaller
+  size can only reject positions the larger window would also fail.
 - **Work area excludes the taskbar:** a position entirely over the taskbar
-  strip is not visible (`bounds.rs:257-263` test).
+  strip is not visible (pinned by test).
 - **Corrupt values drop the whole geometry**, not one field — NaN, ∞, 1e300
-  anywhere means full fallback (`bounds.rs:87-99`).
+  anywhere means full fallback.
 - **Monitor enumeration failed:** an empty display list can prove nothing, so
-  it centers (`src-tauri/src/window.rs:43-63`, `bounds.rs:241-247`).
+  the position is dropped (`src-tauri/src/window.rs:72-80`) — and then, with
+  no monitor to dock to either, the window centres.
 - Negative coordinates are *valid* (a monitor left of primary) — that is not
-  one of the failure causes (`bounds.rs:161-167`).
+  one of the failure causes; the dock math handles them too
+  (`dock_follows_a_monitor_left_of_primary`).
 
 If the position is being *saved* wrong rather than restored wrong:
 
 - **The minimized-save guard:** a minimized window measures at
   (-32000,-32000); saving that would clobber real geometry, so a minimized
   window contributes nothing and the last debounced value is used instead
-  (`src-tauri/src/window.rs:65-72`).
+  (`src-tauri/src/window.rs`, `current_bounds`).
 - **Inner size on purpose:** restore applies through `set_size` = inner size,
   so the save must record inner size too — saving the outer rect would grow
-  the window by the decoration size (~16×39 px) on every launch, forever
-  (`src-tauri/src/window.rs:73-78`).
+  the window by the decoration size (~16×39 px) on every launch, forever.
+  Docking saves the same way: the `Moved`/`Resized` events it raises go
+  through the normal debounced save, so a docked position persists exactly
+  like a drag.
 - Saves are debounced 500 ms and flushed on both close paths
-  (`src-tauri/src/window.rs:132-141`); a kill mid-drag keeps the last
-  debounced value.
+  (`src-tauri/src/window.rs`, `schedule_bounds_save`); a kill mid-drag keeps
+  the last debounced value.
 
 ### Hotkey chip missing vs. the "taken" notice
 
@@ -317,12 +420,28 @@ Two different states that look similar:
   (`src-tauri/src/hotkey.rs:43-56`). The notice renders only when the
   accelerator is non-empty AND unregistered — accusing another app of
   stealing a nameless key would be a false claim
-  (`src/views/MainView.tsx:133-142`).
+  (`src/views/MainView.tsx`, the notice right after the Record button).
 
 Also remember the hotkey is **ignored while Settings is open** — you may be
-typing the hotkey itself into the hotkey field (`src/App.tsx:11-45`, the
-gated bridge wrapper). If the hotkey "stops working" with Settings open, that
-is the feature.
+typing the hotkey itself into the hotkey field. The session hook takes a
+`hotkeyEnabled` predicate that App answers with "Settings is not open"
+(`src/App.tsx:34`, `src/state/useSession.ts:274-277`). If the hotkey "stops
+working" with Settings open, that is the feature.
+
+**The shortcut changed but still fires the old combo / reports taken.** A
+changed hotkey is re-registered from the main thread — `set_settings` is
+async now, and it hops back with `run_on_main_thread` + a oneshot before
+recording the result (`src-tauri/src/commands.rs:142-155`), because
+RegisterHotKey binds a hot key to the calling thread's window. If the event
+loop refuses the hop (it is shutting down), registration is attempted from
+the current thread rather than reporting a key nobody tried. Re-open the
+main view after saving: the chip and notice re-read `hotkey_status`.
+
+**Ctrl+Shift+F does nothing.** That combo toggles Focus mode *inside* the
+window only (it is not a global shortcut, and it is ignored while a text
+field has focus). If you set the global hotkey to the same combo, the OS
+consumes it before the window ever sees it — use the ◎ header button, or
+pick a different global hotkey.
 
 ### Answers slower than ~1 s
 
@@ -347,29 +466,40 @@ flowchart LR
   stage; `core/src/session/machine.rs:275-277`.)
 - **`firstTokenMs − sttFinalizeMs` is large:** the LLM leg is slow. Check in
   order:
-  1. **Was the pre-warm defeated?** Warming fires on Record, on Ask, and on
-     Stop (`core/src/session/machine.rs:229-231,262-266,307`) but is
-     throttled to one warm per origin per 2 s
-     (`core/src/llm/warm.rs:34,50-66`) — rapid-fire supersession can land a
-     request on a colder connection than usual. Also: the warm only works
-     because every request rides the one shared `reqwest::Client`
-     (`core/src/llm/http.rs:5-12`) with a 120 s pool idle timeout
-     (`http.rs:24`); a recording longer than that can outlive the warmed
-     socket from Record time — the Stop-time warm exists to re-cover exactly
-     this.
+  1. **Was the pre-warm defeated?** Warming fires on Record, on Stop and on
+     the 120 s auto-stop (`core/src/session/machine.rs:230,265,576`) — not
+     on Ask (RS-1: the answer request fires microseconds later, so a warm
+     could only race it for the pool) — and is throttled to one warm per
+     origin per 2 s (`core/src/llm/warm.rs:34,50-66`), so rapid-fire
+     supersession can land a request on a colder connection than usual.
+     Also: the warm only works because every cloud request rides the one
+     shared `reqwest::Client` (`core/src/llm/http.rs:1-12`) with a 120 s pool
+     idle timeout (`http.rs:30`); a recording longer than that can outlive
+     the warmed socket from Record time — the Stop-time warm exists to
+     re-cover exactly this. Since RS-6 the client also probes idle sockets
+     with TCP keepalive from 20 s (a NAT/VPN gateway that forgot the mapping
+     used to cost a dead first write plus a cold retry) and gives up on a
+     black-holed connect after 3 s instead of the OS's ~21 s
+     (`http.rs:38-60`) — a first word that arrives after roughly 3–4 s with
+     a healthy provider is the retry policy doing its job on a bad route.
   2. **Provider choice.** Groq's gpt-oss is a reasoning model; the app
      already sends `reasoning_effort: "low"` and `include_reasoning: false`
      (`core/src/llm/groq.rs:61-67`), but first-word behavior still differs
-     between providers — flip the provider and compare.
-  3. **Prompt size.** The whole resume + JD rides every request. The
-     Anthropic cache-split means a style flip never invalidates the cached
-     profile — but honesty: below Haiku's 4096-token minimum the
+     between providers — flip the provider and compare. Free local voice is
+     not in the ~1 s class at all: expect seconds to tens of seconds on a
+     laptop CPU, with ceilings of 90 s / 300 s.
+  3. **Prompt size.** The whole active profile — resume, job description,
+     focus, extra instructions — rides every request. The Anthropic
+     cache-split means a style flip never invalidates the cached profile,
+     and a *profile switch* costs at most one cache write on the next
+     question — but honesty: below Haiku's 4096-token minimum the
      `cache_control` marker is a silent no-op, and it only starts paying at
      roughly 16 K+ characters of profile
      (`core/src/llm/anthropic.rs`, `request_body`).
      `usage.cache_read_input_tokens` is parsed and exposed as the ground
      truth (`anthropic.rs`, `last_cache_read_input_tokens` + the usage parse
-     in `apply_event`).
+     in `apply_event`). If a profile you rarely use is the fat one, keep it
+     as a separate profile rather than carrying its text in every call.
 - **`firstTokenMs == totalMs`:** the provider returned a complete answer
   without ever streaming a delta; the metric reports total rather than lying
   with 0 (`core/src/session/mod.rs:36-49`).
@@ -411,11 +541,118 @@ If it recurs, suspects in order of likelihood:
    than stalling the audio engine. This loses mid-recording audio, not
    specifically the tail — but it is the only other place frames can vanish.
 
+### The Ask box, the transcript and the chips vanished
+
+Focus mode is on (the ◎ header button is pressed, or you hit Ctrl+Shift+F
+inside the window). It hides the profile chips, the Ask row and its hints,
+the local-mode banner and the "Question heard" strip via the `hidden`
+attribute and grows the answer text to 18 px; the header, the answer, the
+error box, the status line and the Record row stay. It is not persisted —
+a relaunch starts with everything visible. Press the button (or the combo)
+again.
+
+### "Question heard" is a single line
+
+The transcript strip auto-collapses to a one-line caption of the question
+once recording ends and stays open only while starting / recording /
+finalizing, or when idle with no question yet (so the pinned placeholder is
+still visible). Click its heading (a button with `aria-expanded`) to open
+it; it collapses again on the next finished question.
+
+### Answers grounded in the wrong job — or in nothing
+
+The prompt is built from the **active** call profile, the one whose chip is
+pressed on the main view (`src-tauri/src/commands.rs:358-360`), and it is
+built when a session starts, so a switch during a recording applies to the
+*next* one. If the chips are missing, you have a single profile. If the
+main view says `No resume or job description saved for <name> — answers
+won't be grounded. Add them in Settings.`, the active profile is empty on
+both fields and the grounding note is deliberately omitted (§7). A switch to
+a profile that no longer exists is ignored — the chip that stays lit is the
+truth, not the one you clicked.
+
+### The window shows up in a screen share or recording
+
+The app requests Windows capture exclusion. Its effect depends on the
+Windows version and capture method. Check the recorded compatibility results
+and test your intended sharing setup before relying on it.
+
+**What the app does:** before the window is first shown it calls Tauri's
+`set_content_protected(true)` (`src-tauri/src/lib.rs:125`), which asks
+Windows for display affinity `WDA_EXCLUDEFROMCAPTURE` through
+[`SetWindowDisplayAffinity`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowdisplayaffinity).
+There is no toggle. That display affinity value is supported only on
+Windows 10 version 2004 (build 19041) or later, and Microsoft describes it as
+protection against a specific set of public capture APIs, not a guarantee
+against every capture method.
+
+**What the app checks:** after the request, the app reads the window's
+display affinity back from Windows (`GetWindowDisplayAffinity`) and refuses to
+start unless it is `WDA_EXCLUDEFROMCAPTURE`; the reason is written to
+`crash.log`. This is needed because tao 0.35 discards the result of the
+underlying Windows call. **What it cannot check:** a capture method outside
+Microsoft's list, a hardware capture device or a phone camera can still show
+the window with no error from the app.
+
+**What to do:**
+
+1. Check `winver`: Windows 10 version 2004 or later, or Windows 11.
+2. Test the exact setup you will use before the call: the conferencing
+   application and its version, whole-screen versus single-window sharing,
+   and any recording tool. Share or record, and look at the result from a
+   second device or the recording itself.
+3. If the window appears, do not rely on the exclusion for that setup. Report
+   the conferencing application and version, the Windows build and the
+   capture mode, so the result can be added to the table below.
+
+### Tested sharing configurations
+
+Only configurations with a recorded run appear here; each row also has a
+matching entry in the results ledger of
+[RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md#part-b--results-ledger). A result
+applies to that application version, Windows build and capture mode only.
+
+| Conferencing app + version | OS build | Capture mode | Result | Date |
+|---|---|---|---|---|
+| — | — | — | No configuration has been tested and recorded yet. | — |
+
+### Free local voice mode
+
+Setup, limits and logs are in [FREE_VOICE_MODE.md](FREE_VOICE_MODE.md);
+this is the runtime error map. Every local message reaches you through the
+same envelopes and codes as the cloud ones, with these texts:
+
+| Message | Code | What it means / fix |
+|---|---|---|
+| `Free voice is not installed yet. Run scripts\setup-free-voice.ps1 from the project folder, then retry. Setup requires Python and several GB of free disk space.` | `internal` (`src-tauri/src/local_voice.rs:123-125`) | `%LOCALAPPDATA%\AI Call Assistant\local-voice.json` is missing, unreadable, names a *relative* folder, or the recorded executables cannot be spawned. Run the setup script; a hand-edited config must carry an absolute `dataDir`. |
+| `Free mode is already starting. Please wait.` | `internal` (`local_voice.rs:273-276`) | A second **Start and warm** while the first is still running; the command is serialized by a `try_lock`. Wait for the panel to settle. |
+| `Local speech did not start. Check speech.log in your free voice setup folder and rerun setup if the models are missing.` | `internal` (`local_voice.rs:291-293`) | The speech service was launched but did not report ready within 60 s. Its stderr is `speech.log` in the setup folder (unbuffered, so the crash line is there). |
+| `Qwen3.5 2B is not installed in the running Ollama service. Run free voice setup to finish the download.` | `internal` (`local_voice.rs:294-296`) | Ollama answers `/api/tags` but the model tag is absent — usually a download that was interrupted, or a pre-existing Ollama instance with a different model folder. Close that instance before setup, or rerun setup. |
+| `Could not warm Ollama. Check free voice setup and available memory, then retry.` / `Invalid Ollama warm-up response.` | `llm_http` (`core/src/llm/local.rs:194-215`) | The warm-up request (an empty chat that loads the model for 10 min) failed or returned garbage. Almost always RAM: the runner wants ~3 GB. |
+| `Qwen3.5 2B is not installed. Run free voice setup to download it.` | `llm_http` (404, `local.rs:47`) | Same as above, seen at answer time. |
+| `Ollama could not load or run the local model. Close unused apps to free several GB of RAM, then start and warm free mode again. Check ollama.log if this continues.` | `llm_http` (500, `local.rs:48`) | Model load failed — `std::bad_alloc` in `ollama.log` is the usual signature. Free memory (and Windows paging space), then warm again. |
+| `Ollama returned HTTP N. Check the local service and retry.` | `llm_http` (`local.rs:49`) | Anything else from Ollama. |
+| `Free local mode supports about 7 KB of combined instructions, profile (resume, job description, focus, extra instructions) and question. Shorten the active profile in Settings or use a cloud model.` | `llm_http` (`local.rs:19-24,62-63`) | The joined prompt plus the question exceeds 7,000 UTF-8 bytes. Checked *before* dialling, so nothing was sent. The same message appears before recording starts when the active profile leaves no room for any question, and before a typed question is sent when that question does not fit. With local mode selected, Settings shows the exact bytes the profile leaves for a question, computed by the same code that enforces the cap. It warns under 200 bytes and says when no question fits. Every profile field counts. |
+| `Ollama is unavailable. Open Settings and start and warm free local mode.` / `The local answer connection ended unexpectedly. Try again.` / `Ollama stopped before finishing the answer. Try again.` / `Ollama returned an invalid streaming response.` / `The local model returned an empty answer. Try again.` | `llm_http` (`local.rs:128-190`) | The service is not running (start and warm it), died mid-answer, closed the stream without a `done` frame, streamed something that is not NDJSON, or produced only whitespace. Not retried: the local provider has no retry predicate, and the connection is loopback. |
+| `Ollama could not generate an answer. Check that qwen3.5:2b is installed, then start and warm free mode in Settings.` | `llm_http` (`local.rs:104-108`) | Ollama sent an error frame mid-stream; its detail is deliberately not echoed. |
+| `Local speech is unavailable. Open Settings and start and warm free local mode.` | `stt_error` (`core/src/stt/local.rs:128`) | The WebSocket to `127.0.0.1:8765` could not be opened. Start and warm; check `speech.log`. |
+| `Invalid local speech handshake.` / `Local speech is busy or incompatible. Wait for the previous recording to finish, then retry.` / `Local speech closed before it was ready.` / `Local speech did not become ready. Start and warm it in Settings.` | `stt_error` (`stt/local.rs:133-147`) | The service answered but not with the expected ready handshake — a second recording overlapping the previous one's finalize, an older service protocol, or a model still loading. |
+| `Local speech could not keep up with audio. Close other CPU-heavy apps and retry.` / `Local speech fell behind; the recording was stopped.` | `stt_error` (`stt/local.rs:152-153,176-177`) | Inference is slower than real time and the bounded audio channel overflowed. Free CPU, or use a cloud provider for that call. |
+| `Lost the local speech connection.` / `Lost local speech while sending the final audio.` / `Could not finalize local speech.` / `Local speech did not finish in time.` / `Local speech service stopped unexpectedly.` | `stt_error` (`stt/local.rs:98,162-192`) | The service died or the 5 s finalize cap expired (§3 — the finalize ceiling is the same as Deepgram's). Same policy as `stt_error` above: one honest error, the session is torn down. |
+| `Local speech returned invalid text.` / `…an invalid transcript.` / `…an invalid final transcript.` / `Local speech could not transcribe the recording. Check the speech service log and retry.` | `stt_error` (`stt/local.rs:203-212`) | The service's JSON was malformed or it reported an error; `speech.log` has the detail. |
+
+Timeouts in this mode: first token 90 s, total answer 300 s
+(`core/src/session/mod.rs:143-144`); STT connect and finalize keep the 5 s
+caps. These are ceilings, not speed promises. The "Answers slower than ~1 s"
+checklist above mostly does not apply — there is no pre-warm (loading is the
+explicit **Start and warm**), no shared pool, and the model stays warm for
+ten minutes after its last use.
+
 ### crash.log
 
 **Location:** `%APPDATA%\com.aicallhelper.app\crash.log` — the app data dir
-resolved at startup (`src-tauri/src/lib.rs:42-46`; identifier from
-`src-tauri/tauri.conf.json:5`).
+resolved at startup (`src-tauri/src/lib.rs:56-60`; identifier from
+`src-tauri/tauri.conf.json`).
 
 **Format:** one line per panic —
 `[YYYY-MM-DDTHH:MM:SSZ] panic at file:line:col: message`
@@ -437,3 +674,8 @@ resolved at startup (`src-tauri/src/lib.rs:42-46`; identifier from
   (`logging.rs:3-7`).
 - A log write that itself fails is silently dropped — a crash log must not
   turn one crash into two (`logging.rs:39-43`).
+- Lines like `[startup] window built: 212ms` are **not** in this file: they
+  are the debug-build stage timings (settings loaded / window built /
+  geometry restored / content protected / shown), printed to stderr by
+  `npm run tauri dev` only and compiled out of release builds
+  (`src-tauri/src/lib.rs:28-34`, RS-9).
