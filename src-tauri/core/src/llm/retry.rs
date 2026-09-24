@@ -97,9 +97,6 @@ where
     // Cancellation may be *why* the attempt failed (the provider aborts its
     // request on cancel). Either signal — the token or an aborted error —
     // means the user moved on, and no error may outrank that.
-    if cancel.is_cancelled() {
-        return Err(AppError::aborted());
-    }
     if first_err.is_aborted() {
         return Err(first_err);
     }
