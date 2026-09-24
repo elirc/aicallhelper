@@ -358,7 +358,6 @@ export function useSession(options: UseSessionOptions = {}): SessionApi {
     // Same supersede as startFlow: drain a buffered delta before ask/start
     // retires the streaming entry.
     flushRef.current();
-    if (s.ui === 'answering' && s.activeId !== null) bridge.cancelSession(s.activeId);
     keyCounter.current += 1;
     const key = `attempt-${keyCounter.current}`;
     attemptRef.current = key;
