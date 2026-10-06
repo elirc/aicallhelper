@@ -107,7 +107,7 @@ The provider wires are deliberately asymmetric in ownership:
   loading the model is the explicit "Start and warm" gesture in Settings
   (ADR 005, Scope). The choice of speech and answer wire is a *capability of
   the provider* (`LlmProviderKind::uses_deepgram()` / `needs_cloud_keys()`,
-  `core/src/llm/mod.rs:66-90`), not a scattered `== Local` check.
+  `src-tauri/core/src/llm/mod.rs:66-90`), not a scattered `== Local` check.
 
 Crossing rules at the boundaries:
 
@@ -116,7 +116,7 @@ Crossing rules at the boundaries:
   shell itself broke — or, the one deliberate exception, that a
   `set_settings` patch carried a value outside a closed enum
   (`llmProvider`, `answerStyle`, `launchPlacement`, `streamFollow` are typed
-  on the Rust side, `core/src/store/mod.rs:302-316`) and failed argument
+  on the Rust side, `src-tauri/core/src/store/mod.rs:302-316`) and failed argument
   deserialization before the command body ran. The bridge folds any
   rejection into `{ code: "internal" }` (`src-tauri/src/commands.rs:1-4`,
   `src/bridge.ts:41-50`). Lenient parsing (`parse_or_default`) is reserved
@@ -280,7 +280,7 @@ stateDiagram-v2
 | 5.4 | Audio routing: frames only for the live, not-yet-stopped session | `push_audio` matches id **and** `Phase::Recording`; post-stop and stale-id frames vanish (they would race the CloseStream flush) | `machine.rs` (`SessionManager::push_audio`) |
 | 5.5 | One honest `stt_error` for a mid-recording/mid-finalize death; a *late* death must not kill a streaming answer | Mid-stream: error → abort → `fail()`. During finalize, a `biased` select polls the STT channel **before** the finalize future, so a death that queues its error and resolves the finalize with truncated text in the same instant always loses to the error. After finalize: `drop(rx)` makes a late socket close structurally unreachable | `machine.rs` (`drive_recording`), `machine.rs` (`drive_recording`), `machine.rs` (`drive_recording`) |
 | 5.6 | One error per stream, never after abort; pre-registration errors are queued | `SessionSttSink.errored: AtomicBool` enforces at-most-once even against a misbehaving stream; the unbounded channel queues an error fired inside `connect()` itself until the driver listens. `Inner::fail` takes slot ownership exactly once and never emits `aborted` | `machine.rs` (`SessionSttSink`), `machine.rs` (`Inner::fail`) |
-| 5.7 | Empty transcript → `no_speech`, never an LLM call on an empty prompt | Trim-and-check after finalize, canonical message pinned as a constant | `machine.rs` (`drive_recording`), `core/src/error.rs:99` |
+| 5.7 | Empty transcript → `no_speech`, never an LLM call on an empty prompt | Trim-and-check after finalize, canonical message pinned as a constant | `machine.rs` (`drive_recording`), `src-tauri/core/src/error.rs:99` |
 | 5.8 | Ask validates before superseding; typed and spoken questions share one event shape | Validation runs before `replace()`; the session is born in `Finishing`; the trimmed question replays as one final `stt:partial`; `sttFinalizeMs` is 0 | `machine.rs` (`SessionManager::ask`) |
 | 5.9 | Timeout interplay; nothing paints after an error | Deadlines are `stopped_at + limit` (`sleep_until`), so the clock is the stop instant, not task-resume time. The first delta disarms the first-token arm; on any timeout `fail()` kills the gate **before** emitting, so racing deltas are suppressed | `machine.rs` (`run_answer`), `machine.rs` (`Inner::fail`), `machine.rs` (`SessionLlmSink::on_delta`) |
 | 5.10 | Cancel is silent | `cancel()` takes the slot and runs `teardown()` — no done, no error; stale ids are a no-op | `machine.rs` (`SessionManager::cancel`) |

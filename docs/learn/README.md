@@ -18,7 +18,9 @@ code does.
 
 1. Read the lesson with the cited file open. Citations are `path:line` against
    the current tree — if a file has drifted, the named test is the stable
-   anchor.
+   anchor. Two path shorthands, used across all of `docs/`: `core/src/...`
+   means `src-tauri/core/src/...` (the `app-core` crate), and `src/...` is the
+   frontend at the repo root.
 2. Run the named test before and after any break-it edit:
 
    ```sh

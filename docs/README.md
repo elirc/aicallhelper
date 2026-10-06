@@ -2,6 +2,10 @@
 
 What each document is for, and which one to open first.
 
+Path shorthand used throughout these docs: `core/src/...` means
+`src-tauri/core/src/...` (the `app-core` crate); `src/...` is the frontend at
+the repo root.
+
 Two of these are **normative** — they pin behavior, and changing them is a
 product decision:
 
@@ -20,8 +24,8 @@ The rest explain, diagnose, or look forward:
   crate/module map and the path a question takes from Record press to
   streamed answer.
 - **[adr/](adr/)** — architecture decision records: the choices that could
-  have gone another way, and why they didn't. Fourteen so far, the newest
-  two covering window placement (dock to the camera) and call profiles.
+  have gone another way, and why they didn't. Sixteen so far, the newest
+  two covering session outcomes/adoption and settings revisions.
 - **[learn/](learn/)** — a guided tour of the codebase, for coming back to it
   cold after months away.
 - **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** — symptom → cause → fix for
